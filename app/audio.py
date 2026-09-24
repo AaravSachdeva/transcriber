@@ -42,12 +42,14 @@ class AudioRecorder:
         self._reader_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
         self._started_at: float | None = None
+        self.level = 0.0  # RMS of the latest block, for the overlay
 
     def _callback(self, indata, frames, _stream_time, status) -> None:  # type: ignore[override]
         if status:
             logger.warning(f"Audio stream status: {status}")
         # Keep the callback lightweight and non-blocking.
         block = indata.copy()
+        self.level = float(np.sqrt(np.mean(np.square(block))))
         with self._lock:
             self._frames.append(block)
 
@@ -100,6 +102,7 @@ class AudioRecorder:
         self._stream.close()
         self._stream = None
         self._started_at = None
+        self.level = 0.0
 
         with self._lock:
             if len(self._frames) == 0:

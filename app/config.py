@@ -46,7 +46,9 @@ class OllamaConfig:
     enabled: bool = True
     timeout_seconds: int = 60
     # Small context keeps the KV cache small, which is what actually costs VRAM here.
-    num_ctx: int = 1024
+    # 2048, not 1024: the prompt and its example turns take ~350 tokens, and on overflow
+    # Ollama truncates from the front, which drops the system prompt first.
+    num_ctx: int = 2048
     num_predict: int = 512
     # Keep the model resident between dictations so no reload lands in the latency path.
     keep_alive: str = "30m"
@@ -91,6 +93,17 @@ class AppConfig:
     autostart: bool = False
     # Milliseconds to wait after synthesizing Ctrl+V before restoring the old clipboard.
     paste_settle_ms: int = 150
+    # exe (lowercase) -> key that accepts the app's @mention / #channel suggestion.
+    # Spoken mentions are converted only in these apps, and typed so the popup opens.
+    # WhatsApp is left out on purpose: its only accept key is Enter, which sends the
+    # message when nothing matched.
+    mention_accept_keys: dict[str, str] = field(default_factory=lambda: {
+        "code.exe": "tab", "slack.exe": "tab", "discord.exe": "tab",
+        "teams.exe": "tab", "ms-teams.exe": "tab",
+    })
+    # How long the popup gets to appear before the accept key. Raise it if a slow app
+    # accepts nothing or the wrong suggestion.
+    mention_popup_ms: int = 400
 
     def save(self, path: Path = SETTINGS_PATH) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

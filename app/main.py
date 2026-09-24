@@ -20,6 +20,7 @@ from . import config
 from .controller import Controller
 from .store import Store
 from .ui import theme
+from .ui.overlay import Overlay
 from .ui.tray import Tray
 from .ui.window import MainWindow
 
@@ -53,6 +54,9 @@ def main() -> int:
     controller.stateChanged.connect(tray.set_state)
     controller.statusMessage.connect(tray.set_message)
     tray.show()
+
+    overlay = Overlay(lambda: controller.level)
+    controller.stateChanged.connect(overlay.set_state)
 
     window.show()
 

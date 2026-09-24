@@ -23,6 +23,37 @@ Short dictations skip the LLM entirely, so a two-word reply lands immediately.
 The LLM also adapts to where you are typing: terser in a code editor, conversational in
 Slack, a bare command in a terminal, full sentences in an email client.
 
+## Voice commands
+
+Some phrases turn into what the app in front of you expects typed:
+
+- **"slash ponytail review"** at the start of a dictation, in VS Code or a terminal,
+  becomes `/ponytail-review`. This calls a Claude Code skill. Names are matched against
+  the skills and commands in `~/.claude`, so spoken words become part of the name when a
+  skill by that name exists. Otherwise they become arguments. A slash command skips the
+  LLM.
+- **"at the rate Rahul"** or **"tag Rahul"** becomes `@Rahul`. **"at the rate app slash
+  controller dot py"** becomes `@app/controller.py` (you can also say underscore and
+  dash). **"tag everyone"** becomes `@channel` in Slack and `@everyone` in Discord and
+  Teams. **"hashtag general"** becomes `#general` in Slack and Discord.
+  - These tokens are typed rather than pasted, so the app opens its suggestion popup, and
+    Tab picks the match.
+  - This works in VS Code (Claude Code's file picker), Slack, Discord and Teams.
+  - "tag" works only before a capitalised name, so "tag me later" is left alone.
+- **"new line"**, **"new paragraph"** and **"bullet point"** become line breaks and
+  `- ` bullets. They are off in code editors, where "add a new line" is ordinary speech,
+  and in terminals, where a pasted line break runs the command.
+
+WhatsApp is deliberately left out of mentions. Its popup accepts only with Enter, and
+Enter sends the message when nothing matched.
+
+You can set two knobs in `settings.json`:
+
+- `mention_accept_keys` maps an exe name to its accept key (`"tab"` or `"enter"`). Remove
+  an app from it to turn mentions off there.
+- `mention_popup_ms` is how long to wait for the popup (default 400). Raise it if a slow
+  app accepts nothing.
+
 ## Requirements
 
 - Windows 10 or 11

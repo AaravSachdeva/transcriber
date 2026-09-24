@@ -20,6 +20,7 @@ from PySide6.QtCore import QMimeData
 from PySide6.QtGui import QGuiApplication
 from pynput import keyboard
 
+from app.commands import TOKEN
 from app.winctx import user32
 
 _controller = keyboard.Controller()
@@ -88,12 +89,17 @@ def _wait(ms: int) -> None:
         user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0x40 << 16)
 
 
-def paste_text(text: str, settle_ms: int = 150, restore: bool = True) -> None:
+def paste_text(text: str, settle_ms: int = 150, restore: bool = True,
+               accept_key: Optional[str] = None, popup_ms: int = 400) -> None:
     """Paste `text` at the cursor, then put the previous clipboard contents back.
 
     `settle_ms` is load bearing. Ctrl+V is asynchronous: the keystroke returns
     immediately and the receiving application reads the clipboard a moment later.
     Restoring too early truncates or blanks the paste in slower applications.
+
+    With `accept_key` ("tab", "enter"), @mention and #channel tokens are typed rather
+    than pasted, so the app opens its suggestion popup, and the key accepts the match.
+    A pasted "@Rahul" is plain text; a typed and accepted one is a real mention.
     """
     if not text:
         logger.warning("paste_text called with empty text; nothing to do.")
@@ -102,21 +108,33 @@ def paste_text(text: str, settle_ms: int = 150, restore: bool = True) -> None:
     clipboard = QGuiApplication.clipboard()
     saved = _snapshot() if restore else None
 
-    clipboard.setText(text)
-    if not clipboard.ownsClipboard():
-        # Qt has already retried for 300 ms. Ctrl+V now would paste the old clipboard.
-        logger.error("Another app is holding the clipboard; nothing pasted.")
-        return
-    _clear_modifiers()
-    with _controller.pressed(keyboard.Key.ctrl):
-        _controller.tap("v")
+    # re.split with one capture group puts the tokens at the odd indexes.
+    parts = TOKEN.split(text) if accept_key else [text]
+    for i, part in enumerate(parts):
+        if i % 2:
+            # ponytail: an app that adds its own space after an accepted mention leaves
+            # a double space before the next word. Harmless, so not compensated for.
+            _controller.type(part)
+            _wait(popup_ms)
+            _controller.tap(getattr(keyboard.Key, accept_key))
+            continue
+        if not part:
+            continue
+        clipboard.setText(part)
+        if not clipboard.ownsClipboard():
+            # Qt has already retried for 300 ms. Ctrl+V now would paste the old clipboard.
+            logger.error("Another app is holding the clipboard; nothing pasted.")
+            return
+        _clear_modifiers()
+        with _controller.pressed(keyboard.Key.ctrl):
+            _controller.tap("v")
+        # ponytail: fixed settle delay, not a handshake. If a slow app ever pastes
+        # truncated text, poll GetClipboardSequenceNumber instead of sleeping.
+        _wait(settle_ms)
     logger.info(f"Pasted {len(text.split())} words at the cursor.")
 
     if saved is None:
         return
-    # ponytail: fixed settle delay, not a handshake. If a slow app ever pastes
-    # truncated text, poll GetClipboardSequenceNumber instead of sleeping.
-    _wait(settle_ms)
     clipboard.setMimeData(saved)
     if not clipboard.ownsClipboard():
         logger.warning("Could not restore the previous clipboard; another app is holding it.")

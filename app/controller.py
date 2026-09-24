@@ -23,7 +23,7 @@ from typing import Optional
 from loguru import logger
 from PySide6.QtCore import QObject, Signal, Slot
 
-from . import output, winctx
+from . import commands, output, winctx
 from .audio import AudioRecorder, RecordedAudio
 from .config import AppConfig
 from .hotkey import HoldToggleHotkey
@@ -119,6 +119,10 @@ class Controller(QObject):
     @property
     def state(self) -> State:
         return self._state
+
+    @property
+    def level(self) -> float:
+        return self._recorder.level
 
     def _set_state(self, state: State) -> None:
         if state == self._state:
@@ -233,7 +237,7 @@ class Controller(QObject):
 
     def _refine(self, raw: str, asr_ms: int, audio_s: float,
                 fg: Optional[winctx.Foreground]) -> dict:
-        """Snippet, then the LLM gate, then whatever survives."""
+        """Snippet, then spoken commands, then the LLM gate, then whatever survives."""
         base = {"raw": raw, "asr_ms": asr_ms, "audio_s": audio_s, "fg": fg}
 
         snippet = self.cfg.snippets.get(normalize_trigger(raw))
@@ -241,19 +245,26 @@ class Controller(QObject):
             logger.info("Snippet matched; bypassing the LLM.")
             return {**base, "text": snippet, "refined": snippet, "llm_ms": None}
 
-        if len(raw.split()) < self.cfg.llm_word_threshold:
+        text = commands.rewrite(raw, fg, self.cfg.mention_accept_keys)
+        # History shows what was pasted, so a command rewrite counts as a refinement.
+        rewritten = text if text != raw else None
+        if text.startswith("/"):
+            logger.info("Slash command; bypassing the LLM.")
+            return {**base, "text": text, "refined": rewritten, "llm_ms": None}
+
+        if len(text.split()) < self.cfg.llm_word_threshold:
             logger.info(
-                f"Only {len(raw.split())} words; below the threshold of "
+                f"Only {len(text.split())} words; below the threshold of "
                 f"{self.cfg.llm_word_threshold}, so skipping the LLM."
             )
-            return {**base, "text": raw, "refined": None, "llm_ms": None}
+            return {**base, "text": text, "refined": rewritten, "llm_ms": None}
 
         context = fg.context if (fg and self.cfg.context_formatting) else None
-        refined, llm_ms = self._ollama.refine(raw, context)
-        # refined is the raw transcript when the model was unavailable or its output was
+        refined, llm_ms = self._ollama.refine(text, context)
+        # refined is its input when the model was unavailable or its output was
         # rejected; llm_ms is None in exactly those cases, so it doubles as the flag.
         return {**base, "text": refined,
-                "refined": refined if llm_ms is not None else None, "llm_ms": llm_ms}
+                "refined": refined if llm_ms is not None else rewritten, "llm_ms": llm_ms}
 
     # --- back on the GUI thread ---
 
@@ -267,8 +278,13 @@ class Controller(QObject):
 
         text = payload["text"]
         fg: Optional[winctx.Foreground] = payload.get("fg")
+        # Not for a selection edit: re-typing the mentions already in edited text would
+        # re-link them through the popup, and a full name would come out doubled.
+        accept_key = None if (self._is_edit or fg is None) else \
+            self.cfg.mention_accept_keys.get((fg.exe or "").lower())
         try:
-            output.paste_text(text, settle_ms=self.cfg.paste_settle_ms)
+            output.paste_text(text, settle_ms=self.cfg.paste_settle_ms,
+                              accept_key=accept_key, popup_ms=self.cfg.mention_popup_ms)
         except Exception as exc:
             logger.exception(f"Pasting failed: {exc}")
             self._set_state(State.ERROR)

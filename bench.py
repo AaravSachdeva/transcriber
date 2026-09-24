@@ -21,6 +21,9 @@ from pathlib import Path
 import numpy as np
 import requests
 
+# The prompt the real app uses, so the token count is representative.
+from app.llm import SYSTEM_PROMPT
+
 SAMPLE_PATH = Path("bench_sample.wav")
 SAMPLE_RATE = 16_000
 RECORD_SECONDS = 10
@@ -31,13 +34,6 @@ SESSION = requests.Session()
 
 COMPUTE_TYPES = ["int8_float16", "int8"]
 LLM_MODELS = ["llama3.2:3b", "gemma2:2b", "qwen3:1.7b"]
-
-# Matches the prompt the real app will use, so the token count is representative.
-SYSTEM_PROMPT = (
-    "Rewrite the user's dictated text as clean prose. Fix punctuation and "
-    "capitalisation. Remove filler words and spoken self-corrections. Output only "
-    "the rewritten text."
-)
 
 
 def nvidia_used_mib() -> int | None:

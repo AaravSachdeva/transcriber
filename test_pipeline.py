@@ -14,13 +14,14 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
+from app.commands import TOKEN, rewrite, slash_command
 from app.controller import normalize_trigger
 from app.ui.history import _diff_html
 from app.hotkey import Dictation, HoldToggleHotkey
 from app.llm import looks_sane
 from app.store import Store, seconds_saved, wpm
 from app.transcription import MAX_PROMPT_CHARS, build_initial_prompt
-from app.winctx import foreground
+from app.winctx import Foreground, foreground
 
 
 def _hotkey(threshold_ms: int = 400) -> HoldToggleHotkey:
@@ -134,6 +135,76 @@ def test_sanity_guard_rejects_summarising() -> None:
 
 def test_sanity_guard_rejects_empty() -> None:
     assert not looks_sane("something was said", "")
+
+
+def test_sanity_guard_rejects_example_leak() -> None:
+    """Seen in real use: the prompt's own example pasted in place of the dictation.
+    Right length, not one word the speaker said."""
+    assert not looks_sane("I see I see I see", "send it Tuesday")
+
+
+def test_sanity_guard_guards_mentions_and_line_breaks() -> None:
+    assert not looks_sane("@Rahul can you check the build today",
+                          "Can you check the build today?")
+    assert not looks_sane("first point\nsecond point here", "First point, second point here.")
+    assert not looks_sane("please rewrite this whole paragraph", "/rewrite this whole paragraph")
+    bullets = "Buy these:\n- eggs\n- bread\n- milk"
+    assert looks_sane(bullets, bullets)
+
+
+def _fg(exe: str, context: str) -> Foreground:
+    return Foreground(exe, None, context, False)
+
+
+_APPS = {"code.exe": "tab", "slack.exe": "tab"}
+
+
+def test_slash_command() -> None:
+    """The longest installed name wins, so a skill name beats an argument."""
+    skills = {"ponytail", "ponytail-review"}
+    assert slash_command("ponytail review", skills) == "/ponytail-review"
+    assert slash_command("ponytail ultra", skills) == "/ponytail ultra"
+    assert slash_command("Pony tail ultra.", skills) == "/ponytail ultra"  # Whisper split it
+    assert slash_command("clear.", skills) == "/clear"  # not installed: taken literally
+
+    code = _fg("Code.exe", "code")
+    assert rewrite("Slash ponytail review.", code, _APPS, skills) == "/ponytail-review"
+    assert rewrite("Slash ponytail review.", _fg("slack.exe", "chat"), _APPS, skills) \
+        == "Slash ponytail review."
+
+
+def test_rewrite_mentions() -> None:
+    slack, code = _fg("slack.exe", "chat"), _fg("Code.exe", "code")
+    assert rewrite("At the rate Rahul, can you check this?", slack, _APPS) \
+        == "@Rahul, can you check this?"
+    assert rewrite("Tag everyone, standup moved to 5.", slack, _APPS) \
+        == "@channel, standup moved to 5."
+    assert rewrite("Ask tag Priya about it.", slack, _APPS) == "Ask @Priya about it."
+    assert rewrite("Post it in hashtag general.", slack, _APPS) == "Post it in #general."
+    assert rewrite("Explain at the rate app slash controller dot py.", code, _APPS, set()) \
+        == "Explain @app/controller.py."
+    for untouched in ["Prices rose at the rate of 5 percent.", "I'll tag you later.",
+                      "The price tag is too high."]:
+        assert rewrite(untouched, slack, _APPS) == untouched
+    # Mentions only in apps whose popup can be driven; WhatsApp is not one of them.
+    said = "At the rate Rahul, can you check this?"
+    assert rewrite(said, _fg("WhatsApp.exe", "chat"), _APPS) == said
+
+
+def test_rewrite_formatting() -> None:
+    chat = _fg("slack.exe", "chat")
+    assert rewrite("first thing new line second thing", chat, {}) == "first thing\nsecond thing"
+    assert rewrite("Intro. New paragraph. Details.", chat, {}) == "Intro.\n\nDetails."
+    assert rewrite("Buy bullet point eggs bullet point bread", chat, {}) == "Buy\n- eggs\n- bread"
+    # In a prompt to a coding agent "new line" is just words.
+    said = "Add a new line after the import."
+    assert rewrite(said, _fg("Code.exe", "code"), {}, set()) == said
+
+
+def test_mention_tokens() -> None:
+    assert TOKEN.split("hi @Rahul, see #general.") == ["hi ", "@Rahul", ", see ", "#general", "."]
+    assert TOKEN.findall("mail me@example.com about C# and @app/controller.py.") \
+        == ["@app/controller.py"]
 
 
 def test_snippet_normalisation() -> None:
@@ -306,8 +377,17 @@ def test_unusable_mic_falls_back_to_default() -> None:
     assert opened == [None], opened
 
 
+def test_recorder_level() -> None:
+    import numpy as np
+    from app.audio import AudioRecorder
+
+    recorder = AudioRecorder()
+    recorder._callback(np.full((1024, 1), 0.5, np.float32), 1024, None, None)
+    assert abs(recorder.level - 0.5) < 1e-6, recorder.level
+
+
 def main() -> int:
-    tests = [v for k, v in sorted(globals().items())
+    tests =[v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
     failed = []
     for test in tests:
