@@ -81,6 +81,14 @@ def test_threshold_boundary() -> None:
     assert k2.latched
 
 
+def test_low_threshold_still_latches_a_tap() -> None:
+    """A saved threshold of 100 ms made every real tap (90-200 ms) a hold."""
+    k = _hotkey(threshold_ms=100)
+    k.press(0.0)
+    assert k.release(0.15) == Dictation.NOTHING
+    assert k.latched
+
+
 def test_release_without_press_is_ignored() -> None:
     """Right Ctrl released while the app was starting, so the press was never seen."""
     k = _hotkey()

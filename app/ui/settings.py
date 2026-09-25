@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 from . import theme
 from .. import autostart
 from ..config import AppConfig, SETTINGS_PATH
+from ..hotkey import MIN_HOLD_THRESHOLD_MS
 from ..transcription import SAMPLE_RATE
 
 WHISPER_MODELS = [
@@ -150,7 +151,7 @@ class SettingsScreen(QWidget):
         # --- behaviour ---
         section("Behaviour")
         self._hold = QSpinBox()
-        self._hold.setRange(100, 2000)
+        self._hold.setRange(MIN_HOLD_THRESHOLD_MS, 2000)
         self._hold.setSingleStep(50)
         self._hold.setSuffix(" ms")
         self._hold.setValue(cfg.hotkey.hold_threshold_ms)

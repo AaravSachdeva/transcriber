@@ -137,6 +137,10 @@ class Controller(QObject):
     def _on_start(self, is_edit: bool) -> None:
         if self._state in (State.RECORDING, State.PROCESSING):
             logger.debug("Start ignored; already busy.")
+            if self._state == State.PROCESSING:
+                # Otherwise a tap now latches with no recording behind it, and the
+                # user's next tap only unlatches instead of starting.
+                self._hotkey.reset()
             return
         if self._transcriber is None:
             self.statusMessage.emit("Whisper is not loaded.")

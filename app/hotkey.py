@@ -14,6 +14,10 @@ from pynput import keyboard
 # letting it through costs nothing.
 TRIGGER = keyboard.Key.ctrl_r
 
+# A deliberate tap lasts roughly 90-200 ms. A threshold below this turns taps into holds,
+# so tap-to-latch never fires.
+MIN_HOLD_THRESHOLD_MS = 250
+
 
 class Dictation:
     """What the user asked for by the way they pressed the key."""
@@ -41,7 +45,7 @@ class HoldToggleHotkey:
         """:param on_start: called with is_edit=True when Shift was also held."""
         self._on_start = on_start
         self._on_stop = on_stop
-        self._hold_threshold_s = hold_threshold_ms / 1000.0
+        self._hold_threshold_s = max(hold_threshold_ms, MIN_HOLD_THRESHOLD_MS) / 1000.0
 
         self._listener: Optional[keyboard.Listener] = None
         self._pressed_at: Optional[float] = None  # None means the key is not down
