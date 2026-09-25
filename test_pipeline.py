@@ -14,13 +14,15 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
+import numpy as np
+
 from app.commands import TOKEN, rewrite, slash_command
 from app.controller import normalize_trigger
 from app.ui.history import _diff_html
 from app.hotkey import Dictation, HoldToggleHotkey
 from app.llm import looks_sane
 from app.store import Store, seconds_saved, wpm
-from app.transcription import MAX_PROMPT_CHARS, build_initial_prompt
+from app.transcription import MAX_PROMPT_CHARS, LiveTranscript, build_initial_prompt, tidy
 from app.winctx import Foreground, foreground
 
 
@@ -179,6 +181,24 @@ def test_slash_command() -> None:
     assert rewrite("Slash ponytail review.", code, _APPS, skills) == "/ponytail-review"
     assert rewrite("Slash ponytail review.", _fg("slack.exe", "chat"), _APPS, skills) \
         == "Slash ponytail review."
+    # A second command becomes one only when it names a known skill.
+    skills = {"ponytail", "caveman"}
+    assert rewrite("slash ponytail ultra slash caveman ultra", code, _APPS, skills) \
+        == "/ponytail ultra /caveman ultra"
+    assert rewrite("Slash ponytail ultra. Slash caveman ultra.", code, _APPS, skills) \
+        == "/ponytail ultra /caveman ultra"
+    assert rewrite("slash ponytail ultra slash foo", code, _APPS, skills) \
+        == "/ponytail ultra slash foo"
+
+
+def test_tidy() -> None:
+    assert tidy("such as such as the ability to directly directly use") \
+        == "such as the ability to directly use"
+    assert tidy("because of the because of the whisper model") == "because of the whisper model"
+    assert tidy("will will  Will the LLM move") == "will the LLM move"
+    assert tidy("um so I think uh, we ship") == "so I think we ship"
+    for untouched in ["Yes. Yes.", "I think this is it", "10:30 tomorrow"]:
+        assert tidy(untouched) == untouched
 
 
 def test_rewrite_mentions() -> None:
@@ -191,6 +211,7 @@ def test_rewrite_mentions() -> None:
     assert rewrite("Post it in hashtag general.", slack, _APPS) == "Post it in #general."
     assert rewrite("Explain at the rate app slash controller dot py.", code, _APPS, set()) \
         == "Explain @app/controller.py."
+    assert rewrite("add the rate readme dot md", code, _APPS, set()) == "@readme.md"
     for untouched in ["Prices rose at the rate of 5 percent.", "I'll tag you later.",
                       "The price tag is too high."]:
         assert rewrite(untouched, slack, _APPS) == untouched
@@ -392,6 +413,33 @@ def test_recorder_level() -> None:
     recorder = AudioRecorder()
     recorder._callback(np.full((1024, 1), 0.5, np.float32), 1024, None, None)
     assert abs(recorder.level - 0.5) < 1e-6, recorder.level
+
+
+class _SizeWhisper:
+    """Stands in for Whisper: 'transcribes' a segment as its length in VAD windows."""
+
+    def transcribe(self, audio, _prompt):
+        return str(audio.size // 512)
+
+
+def test_live_transcript_cuts_at_pauses() -> None:
+    """A pause after speech ends a segment; silence before speech does not; the tail
+    goes out on finish, in order."""
+    live = LiveTranscript(_SizeWhisper(), None, pause_ms=96)  # 3 windows of 512
+    live._score = lambda w: (np.abs(w).max(axis=1) > 0.5).astype(np.float32)
+    speech, quiet = np.ones((1024, 1), np.float32), np.zeros((1024, 1), np.float32)
+    for block in (speech, speech, quiet, quiet, speech):
+        live.push(block)
+    # 4 speech + 3 quiet windows cut; then 1 quiet + 2 speech left for the tail.
+    assert live.finish() == "7 3"
+
+
+def test_vad_scores_silence_low() -> None:
+    """The real Silero call still takes and returns what we assume across upgrades."""
+    live = LiveTranscript(_SizeWhisper(), None, pause_ms=700)
+    probs = live._score(np.zeros((3, 512), np.float32))
+    live.close()
+    assert probs.shape == (3,) and (probs < 0.5).all(), probs
 
 
 def main() -> int:

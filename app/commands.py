@@ -35,11 +35,14 @@ _NAME = _WORD + r"(?:\s+(?:dot|slash|underscore|dash|hyphen)\s+" + _WORD + ")*"
 _ALL = r"(?:everyone|everybody|all)\b"
 
 _SLASH = re.compile(r"^\s*(?:slash\b|/)\s*(?P<rest>.+)$", re.I | re.S)
-_EVERYONE = re.compile(r"(?:\btag|\bat the rate|@)[\s,:]*" + _ALL, re.I)
+# A second command in the same dictation: "slash ponytail ultra slash caveman ultra".
+_MORE_SLASH = re.compile(r"[\s,.]+slash\s+", re.I)
+# Whisper hears "at the rate" as "add the rate" often enough to accept both.
+_EVERYONE = re.compile(r"(?:\btag|\ba(?:t|dd) the rate|@)[\s,:]*" + _ALL, re.I)
 # "tag" only before a capitalised word, which Whisper gives names: "tag Rahul" is a
 # mention, "tag me later" and "the price tag is" are not.
 _MENTION = re.compile(
-    r"(?:\bat the rate\b(?!\s+of\b)"
+    r"(?:\ba(?:t|dd) the rate\b(?!\s+of\b)"
     r"|\btag\b(?![\s,:]+" + _ALL + r")(?=[\s,:]+(?-i:[A-Z]))"
     r"|@)[\s,:]*(?P<name>" + _NAME + ")",
     re.I,
@@ -104,7 +107,14 @@ def rewrite(text: str, fg: Optional[winctx.Foreground], mention_apps: Container[
         # Claude Code's panel and CLI. Only at the start, where a command has to be.
         slash = _SLASH.match(text)
         if slash:
-            return slash_command(slash["rest"], installed_skills() if skills is None else skills)
+            skills = installed_skills() if skills is None else skills
+            first, *more = _MORE_SLASH.split(slash["rest"])
+            out = [slash_command(first, skills)]
+            for part in more:
+                # Only a known skill: "app slash controller" is a path, not a command.
+                command = slash_command(part, skills)
+                out.append(command if command.split()[0][1:] in skills else "slash " + part)
+            return " ".join(out)
     else:
         # Not in code, where "add a new line" is ordinary speech, and never in a
         # terminal, where a pasted line break runs the command.

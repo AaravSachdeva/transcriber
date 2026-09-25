@@ -71,6 +71,9 @@ class AudioConfig:
     device_index: Optional[int] = None  # None = system default
     # Below this, treat the recording as a stray key tap and skip transcription.
     min_duration_s: float = 0.35
+    # Silence that ends a segment, which is then transcribed while the user keeps
+    # talking. Lower cuts mid-sentence and costs accuracy; higher leaves more for release.
+    pause_ms: int = 700
 
 
 @dataclass

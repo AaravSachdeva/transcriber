@@ -4,7 +4,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Callable, Optional, List
 
 import numpy as np
 import sounddevice as sd
@@ -43,6 +43,7 @@ class AudioRecorder:
         self._lock = threading.Lock()
         self._started_at: float | None = None
         self.level = 0.0  # RMS of the latest block, for the overlay
+        self._on_block: Optional[Callable[[np.ndarray], None]] = None
 
     def _callback(self, indata, frames, _stream_time, status) -> None:  # type: ignore[override]
         if status:
@@ -52,8 +53,10 @@ class AudioRecorder:
         self.level = float(np.sqrt(np.mean(np.square(block))))
         with self._lock:
             self._frames.append(block)
+        if self._on_block is not None:
+            self._on_block(block)  # must only enqueue; this is the PortAudio thread
 
-    def start(self) -> None:
+    def start(self, on_block: Optional[Callable[[np.ndarray], None]] = None) -> None:
         if self._stream is not None:
             logger.debug("AudioRecorder.start() called, but stream already running.")
             return
@@ -62,6 +65,7 @@ class AudioRecorder:
         with self._lock:
             self._frames.clear()
         self._started_at = time.monotonic()
+        self._on_block = on_block
 
         # Validate settings early to fail fast with a useful error. A saved device that
         # cannot record at our rate, or an index PortAudio has since renumbered (it does

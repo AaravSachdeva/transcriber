@@ -7,8 +7,11 @@ Threading, which is the whole difficulty here:
   `_hotkey_stop`. Those only emit signals. With Qt's default AutoConnection an emit from
   another thread is queued onto the GUI thread, so every slot below runs there.
 - PortAudio calls the recorder's callback on its own thread; the recorder only appends
-  to a deque under a lock.
-- Whisper and Ollama run on a plain worker thread and report back by signal.
+  to a deque under a lock and enqueues the block for the LiveTranscript.
+- While recording, LiveTranscript's thread runs Silero VAD and sends each segment that
+  ends in a pause to Whisper.
+- After release, the tail, then Ollama, run on a plain worker thread and report back by
+  signal.
 
 Clipboard work is therefore always on the GUI thread, which is what QClipboard requires.
 """
@@ -29,7 +32,7 @@ from .config import AppConfig
 from .hotkey import HoldToggleHotkey
 from .llm import OllamaClient
 from .store import Store
-from .transcription import TranscriptionService, build_initial_prompt
+from .transcription import LiveTranscript, TranscriptionService, build_initial_prompt, tidy
 
 
 class State(Enum):
@@ -68,6 +71,7 @@ class Controller(QObject):
             device_index=cfg.audio.device_index,
         )
         self._transcriber: Optional[TranscriptionService] = None  # built by start()
+        self._live: Optional[LiveTranscript] = None  # one per recording
         self._ollama = OllamaClient(cfg.ollama)
         self._hotkey = HoldToggleHotkey(
             on_start=lambda is_edit: self._startRequested.emit(is_edit),
@@ -167,15 +171,19 @@ class Controller(QObject):
                 self._hotkey.reset()
                 return
 
+        self._live = LiveTranscript(self._transcriber, build_initial_prompt(self.cfg.vocabulary),
+                                    self.cfg.audio.pause_ms)
         try:
-            self._recorder.start()
+            self._recorder.start(on_block=self._live.push)
         except Exception as exc:
+            self._live.close()
             logger.exception(f"Could not start recording: {exc}")
             self._set_state(State.ERROR)
             self.statusMessage.emit(f"Microphone unavailable: {exc}")
             self._hotkey.reset()
             return
 
+        threading.Thread(target=self._ollama.warm, daemon=True).start()
         self._set_state(State.RECORDING)
         target = self._foreground.exe or "the active window"
         self.statusMessage.emit(f"{'Editing' if is_edit else 'Recording'} for {target}...")
@@ -193,6 +201,8 @@ class Controller(QObject):
             self._set_state(State.ERROR)
             self.statusMessage.emit(f"Recording failed: {exc}")
             return
+        finally:
+            self._live.close()  # no more audio is coming, whatever happens next
 
         if recorded is None or recorded.duration_s < self.cfg.audio.min_duration_s:
             # A stray tap on right Ctrl should not spend two seconds in Whisper.
@@ -204,21 +214,20 @@ class Controller(QObject):
         self._set_state(State.PROCESSING)
         self.statusMessage.emit("Transcribing...")
         threading.Thread(
-            target=self._work, args=(recorded, self._is_edit, self._selection,
+            target=self._work, args=(self._live, recorded, self._is_edit, self._selection,
                                      self._foreground), daemon=True,
         ).start()
 
     # --- worker thread ---
 
-    def _work(self, recorded: RecordedAudio, is_edit: bool, selection: str,
-              fg: Optional[winctx.Foreground]) -> None:
+    def _work(self, live: LiveTranscript, recorded: RecordedAudio, is_edit: bool,
+              selection: str, fg: Optional[winctx.Foreground]) -> None:
         """Transcribe, then refine or edit. No Qt widget and no clipboard here."""
         payload: Optional[dict] = None
         try:
             t0 = time.perf_counter()
-            raw = self._transcriber.transcribe(
-                recorded.data, build_initial_prompt(self.cfg.vocabulary)
-            )
+            # Segments before the last pause are already done; this is the wait the user feels.
+            raw = live.finish()
             asr_ms = int((time.perf_counter() - t0) * 1000)
 
             if not raw:
@@ -249,7 +258,7 @@ class Controller(QObject):
             logger.info("Snippet matched; bypassing the LLM.")
             return {**base, "text": snippet, "refined": snippet, "llm_ms": None}
 
-        text = commands.rewrite(raw, fg, self.cfg.mention_accept_keys)
+        text = commands.rewrite(tidy(raw), fg, self.cfg.mention_accept_keys)
         # History shows what was pasted, so a command rewrite counts as a refinement.
         rewritten = text if text != raw else None
         if text.startswith("/"):

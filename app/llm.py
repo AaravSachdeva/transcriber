@@ -13,8 +13,11 @@ not.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 from loguru import logger
@@ -156,6 +159,9 @@ def looks_sane(raw: str, refined: str) -> bool:
     return True
 
 
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
 class OllamaClient:
     """Minimal client for a local Ollama instance, talking only to /api/chat."""
 
@@ -164,6 +170,7 @@ class OllamaClient:
         self._available: Optional[bool] = None
         self._checked_at = 0.0
         self._recheck_after_s = 30.0
+        self._spawned = False
         # One kept-alive connection for every request. A fresh connection per call costs
         # about 2.2 seconds on Windows, because "localhost" resolves to ::1 first and
         # Ollama listens on IPv4 only. The IPv4 literal in the config avoids that too;
@@ -183,7 +190,38 @@ class OllamaClient:
         self._checked_at = now
         if not self._available:
             logger.warning(f"Ollama is not reachable at {self._cfg.base_url}.")
+            self._start_server()
         return self._available
+
+    def _start_server(self) -> None:
+        """Start a local Ollama once, when it is installed but not running. Without this
+        the LLM went silently unused for a whole afternoon of dictation."""
+        exe = shutil.which("ollama")
+        if self._spawned or not exe or urlparse(self._cfg.base_url).hostname not in _LOCAL_HOSTS:
+            return
+        self._spawned = True
+        logger.info(f"Starting {exe} serve.")
+        try:
+            subprocess.Popen([exe, "serve"], creationflags=subprocess.CREATE_NO_WINDOW,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            logger.warning(f"Could not start Ollama: {exc}")
+            return
+        self._available = None  # probe again on the next dictation, not in 30 seconds
+
+    def warm(self) -> None:
+        """Load the model while the user is still speaking. An empty generate request
+        only loads it; a cold load was 4-6 seconds in the latency path otherwise.
+
+        Runs on its own thread, so a plain request rather than the shared session."""
+        if not (self._cfg.enabled and self.is_available()):
+            return
+        try:
+            requests.post(f"{self._cfg.base_url}/api/generate",
+                          json={"model": self._cfg.model, "keep_alive": self._cfg.keep_alive},
+                          timeout=self._cfg.timeout_seconds)
+        except Exception as exc:
+            logger.debug(f"Ollama warm-up failed (not fatal): {exc}")
 
     def _chat(self, system: str, user: str,
               examples: tuple[tuple[str, str], ...] = ()) -> Optional[str]:

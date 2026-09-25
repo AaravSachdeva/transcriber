@@ -1,19 +1,41 @@
 from __future__ import annotations
 
+import queue
+import re
+import threading
 from typing import Optional
 
 import numpy as np
 from faster_whisper import WhisperModel
+from faster_whisper.vad import get_vad_model
 from loguru import logger
 
 from .config import WhisperConfig
 
 SAMPLE_RATE = 16_000
+VAD_WINDOW = 512   # samples Silero scores at once at 16 kHz (32 ms)
+VAD_CONTEXT = 64   # tail of the previous window Silero sees alongside each one
 
 # Whisper's prompt window is 224 tokens. Overflowing it silently truncates the prompt,
 # and an over-long prompt also makes the model more likely to echo it into the output.
 # Roughly 4 characters per token, kept well clear of the limit.
 MAX_PROMPT_CHARS = 600
+
+# Whole segments Whisper invents on silence. Seen alone ("you") and after a real
+# sentence ("...will that save time  you").
+HALLUCINATIONS = {"you"}
+
+# A phrase of one to four words said twice or more in a row: "such as such as".
+# ponytail: also collapses the rare legitimate repeat ("had had", "very very"); add an
+# allowlist if that bites.
+_REPEAT = re.compile(r"\b(\w+(?:\s+\w+){0,3})(?:[\s,]+\1\b)+", re.I)
+_FILLER = re.compile(r"\b(?:um+|uh+|erm)\b[,.]?\s*", re.I)
+
+
+def tidy(text: str) -> str:
+    """Remove fillers and stutters without the LLM, so they go even when it is skipped,
+    unavailable, or rejected."""
+    return _REPEAT.sub(r"\1", _FILLER.sub("", text)).strip()
 
 
 def build_initial_prompt(vocabulary: list[str]) -> Optional[str]:
@@ -167,6 +189,102 @@ class TranscriptionService:
         )
         # Materialise the lazy generator here so CUDA errors raised during iteration are
         # caught by the caller's fallback rather than escaping later.
-        text = " ".join(seg.text for seg in segments).strip()
+        text = " ".join(t for seg in segments
+                        if (t := seg.text.strip()) and t.lower().strip(".!") not in HALLUCINATIONS)
         logger.debug(f"Transcription info: language={info.language}, duration={info.duration:.2f}s")
         return text
+
+
+class LiveTranscript:
+    """Transcribes a dictation segment by segment while the user is still talking.
+
+    The recorder pushes blocks from its PortAudio thread. A worker thread scores them with
+    the Silero VAD that faster-whisper already bundles and, at each natural pause, sends
+    the finished segment to Whisper. By the time the key comes up only the tail is left.
+    """
+
+    def __init__(self, transcriber: TranscriptionService, prompt: Optional[str],
+                 pause_ms: int, threshold: float = 0.5) -> None:
+        self._transcriber = transcriber
+        self._prompt = prompt
+        self._pause = pause_ms * SAMPLE_RATE // 1000
+        self._threshold = threshold
+        self._session = get_vad_model().session
+        # Silero's recurrent state, carried across calls so it hears one continuous stream.
+        self._h = np.zeros((1, 1, 128), dtype=np.float32)
+        self._c = np.zeros((1, 1, 128), dtype=np.float32)
+        self._context = np.zeros(VAD_CONTEXT, dtype=np.float32)
+        self._audio = np.zeros(0, dtype=np.float32)  # current segment, not yet sent
+        self._scored = 0      # samples of _audio the VAD has seen
+        self._quiet = 0       # samples of silence since the last speech
+        self._heard = False   # speech in the current segment
+        self._texts: list[str] = []
+        self._error: Optional[Exception] = None
+        self._blocks: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def push(self, block: np.ndarray) -> None:
+        """Called on the PortAudio thread, so it only enqueues."""
+        self._blocks.put(block)
+
+    def close(self) -> None:
+        """No more audio is coming."""
+        self._blocks.put(None)
+
+    def finish(self) -> str:
+        """Wait for the segments already cut, transcribe the tail, return the whole text."""
+        self.close()
+        self._thread.join()
+        if self._error is not None:
+            raise self._error
+        self._send(self._audio)
+        return " ".join(t for t in self._texts if t)
+
+    def _run(self) -> None:
+        try:
+            while (block := self._blocks.get()) is not None:
+                for segment in self._cut(block.reshape(len(block), -1).mean(axis=1)):
+                    self._send(segment)
+        except Exception as exc:  # re-raised by finish(), so no audio is lost silently
+            logger.exception(f"Live transcription failed: {exc}")
+            self._error = exc
+
+    def _send(self, segment: np.ndarray) -> None:
+        if segment.size:
+            self._texts.append(self._transcriber.transcribe(segment, self._prompt) or "")
+
+    def _cut(self, audio: np.ndarray) -> list[np.ndarray]:
+        """Append audio; return every segment that has ended in a pause of pause_ms.
+
+        A segment keeps its trailing pause and any leading silence; vad_filter trims both.
+        """
+        self._audio = np.concatenate([self._audio, audio])
+        n = (self._audio.size - self._scored) // VAD_WINDOW
+        if n == 0:
+            return []
+        windows = self._audio[self._scored:self._scored + n * VAD_WINDOW].reshape(n, VAD_WINDOW)
+        segments = []
+        for prob in self._score(windows):
+            self._scored += VAD_WINDOW
+            if prob >= self._threshold:
+                self._heard, self._quiet = True, 0
+            elif self._heard:
+                self._quiet += VAD_WINDOW
+                if self._quiet >= self._pause:
+                    logger.info(f"Pause detected; sending {self._scored / SAMPLE_RATE:.1f}s to Whisper.")
+                    segments.append(self._audio[:self._scored])
+                    self._audio = self._audio[self._scored:]
+                    self._scored = self._quiet = 0
+                    self._heard = False
+        return segments
+
+    def _score(self, windows: np.ndarray) -> np.ndarray:
+        """Speech probability per window. Same row layout as faster-whisper's own
+        SileroVADModel.__call__, which resets the state on every call and so cannot stream."""
+        context = np.vstack([self._context, windows[:-1, -VAD_CONTEXT:]])
+        self._context = windows[-1, -VAD_CONTEXT:].copy()
+        probs, self._h, self._c = self._session.run(
+            None, {"input": np.hstack([context, windows]), "h": self._h, "c": self._c},
+        )
+        return probs
