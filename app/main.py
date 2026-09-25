@@ -50,7 +50,7 @@ def main() -> int:
         store.close()
         app.quit()
 
-    tray = Tray(on_open=window.show_and_raise, on_quit=quit_app)
+    tray = Tray(on_open=window.show_and_raise, on_fix=window.fix_last, on_quit=quit_app)
     controller.stateChanged.connect(tray.set_state)
     controller.statusMessage.connect(tray.set_message)
     tray.show()

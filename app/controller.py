@@ -26,7 +26,7 @@ from typing import Optional
 from loguru import logger
 from PySide6.QtCore import QObject, Signal, Slot
 
-from . import commands, output, winctx
+from . import capture, commands, output, winctx
 from .audio import AudioRecorder, RecordedAudio
 from .config import AppConfig
 from .hotkey import HoldToggleHotkey
@@ -73,6 +73,7 @@ class Controller(QObject):
         self._transcriber: Optional[TranscriptionService] = None  # built by start()
         self._live: Optional[LiveTranscript] = None  # one per recording
         self._ollama = OllamaClient(cfg.ollama)
+        self._watcher = capture.FieldWatcher(on_final=store.set_final)
         self._hotkey = HoldToggleHotkey(
             on_start=lambda is_edit: self._startRequested.emit(is_edit),
             on_stop=lambda: self._stopRequested.emit(),
@@ -116,9 +117,10 @@ class Controller(QObject):
         self.statusMessage.emit("Ready. Hold right Ctrl to dictate.")
 
     def stop(self) -> None:
-        """Release the hotkey hook and the pooled HTTP connection."""
+        """Release the hotkey hook, the pooled HTTP connection and the field watcher."""
         self._hotkey.stop()
         self._ollama.close()
+        self._watcher.stop()
 
     @property
     def state(self) -> State:
@@ -213,6 +215,9 @@ class Controller(QObject):
 
         self._set_state(State.PROCESSING)
         self.statusMessage.emit("Transcribing...")
+        if self.cfg.learn_from_corrections:
+            # Read the text box now, while Whisper runs, so the paste can be found in it.
+            self._watcher.before(self._foreground)
         threading.Thread(
             target=self._work, args=(self._live, recorded, self._is_edit, self._selection,
                                      self._foreground), daemon=True,
@@ -242,6 +247,8 @@ class Controller(QObject):
                                "audio_s": recorded.duration_s, "fg": fg}
             else:
                 payload = self._refine(raw, asr_ms, recorded.duration_s, fg)
+            if "text" in payload:
+                payload["audio"] = recorded
         except Exception as exc:
             logger.exception(f"Dictation pipeline failed: {exc}")
             payload = {"error": f"{type(exc).__name__}: {exc}"}
@@ -311,8 +318,14 @@ class Controller(QObject):
                 app_exe=fg.exe if fg else None, app_title=fg.title if fg else None,
                 context=fg.context if fg else None,
                 asr_ms=payload.get("asr_ms"), llm_ms=payload.get("llm_ms"),
+                is_edit=self._is_edit,
             )
             self.dictationFinished.emit(row_id)
+            if self.cfg.learn_from_corrections and fg is not None:
+                self._watcher.after(fg, row_id, text)
+            if self.cfg.keep_audio:
+                audio = payload["audio"]
+                self.store.save_audio(row_id, audio.data, audio.sample_rate)
         except Exception as exc:
             # The text is already in the document; a failed log must not look like a
             # failed dictation.

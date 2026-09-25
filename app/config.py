@@ -107,6 +107,12 @@ class AppConfig:
     # How long the popup gets to appear before the accept key. Raise it if a slow app
     # accepts nothing or the wrong suggestion.
     mention_popup_ms: int = 400
+    # Read back the text box after a paste, for up to a minute, and keep what the pasted
+    # span ended up as. Only that span is stored, and only on this machine.
+    learn_from_corrections: bool = True
+    # Keep each dictation's recording as a WAV beside the history database. Large, and
+    # it is your voice, so off unless asked for.
+    keep_audio: bool = False
 
     def save(self, path: Path = SETTINGS_PATH) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

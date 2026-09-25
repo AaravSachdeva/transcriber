@@ -18,8 +18,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QGuiApplication, QPalette
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QHeaderView, QLineEdit, QPushButton, QSplitter,
-    QStyledItemDelegate, QTextBrowser, QTreeView, QVBoxLayout, QWidget,
+    QAbstractItemView, QHBoxLayout, QHeaderView, QInputDialog, QLineEdit, QPushButton,
+    QSplitter, QStyledItemDelegate, QTextBrowser, QTreeView, QVBoxLayout, QWidget,
 )
 
 from . import theme
@@ -37,12 +37,12 @@ def _word_key(word: str) -> str:
     return word.strip(".,!?;:\"'()").lower()
 
 
-def _diff_html(raw: str, refined: str, dim: str, accent: str) -> str:
+def _diff_html(raw: str, refined: str, dim: str, accent: str, key=_word_key) -> str:
     """What Whisper heard against what was pasted: removed words struck through in
-    `dim`, added words in `accent`, unchanged words as pasted."""
+    `dim`, added words in `accent`, unchanged words as pasted. A user's correction is
+    diffed with key=str, because there a fixed capital is the point."""
     a, b = raw.split(), refined.split()
-    matcher = SequenceMatcher(a=[_word_key(w) for w in a], b=[_word_key(w) for w in b],
-                              autojunk=False)
+    matcher = SequenceMatcher(a=[key(w) for w in a], b=[key(w) for w in b], autojunk=False)
     out = []
     for op, i1, i2, j1, j2 in matcher.get_opcodes():
         if op == "equal":
@@ -166,12 +166,17 @@ class HistoryScreen(QWidget):
         self._copy.setEnabled(False)
         self._copy.clicked.connect(self._copy_selected)
 
+        self._correct = QPushButton("Correct...")
+        self._correct.setEnabled(False)
+        self._correct.clicked.connect(self._correct_selected)
+
         self._delete = QPushButton("Delete")
         self._delete.setEnabled(False)
         self._delete.clicked.connect(self._delete_selected)
 
         detail_buttons = QHBoxLayout()
         detail_buttons.addWidget(self._copy)
+        detail_buttons.addWidget(self._correct)
         detail_buttons.addWidget(self._delete)
         detail_buttons.addStretch(1)
 
@@ -211,6 +216,7 @@ class HistoryScreen(QWidget):
     def _show_detail(self) -> None:
         row = self._selected_row()
         self._copy.setEnabled(row is not None)
+        self._correct.setEnabled(row is not None)
         self._delete.setEnabled(row is not None)
         if row is None:
             self._detail.clear()
@@ -229,6 +235,8 @@ class HistoryScreen(QWidget):
         if row["asr_ms"]:
             meta.append(f"{row['asr_ms']} ms Whisper")
         meta.append(f"{row['llm_ms']} ms LLM" if row["llm_ms"] else "LLM skipped")
+        if row["final_source"] == "unedited":
+            meta.append("left as pasted")
 
         pasted = row["refined"] or row["raw"]
         html = [
@@ -240,6 +248,12 @@ class HistoryScreen(QWidget):
                 '<p style="font-weight:600; margin-top:14px">What the LLM changed</p>',
                 f"<p>{_diff_html(row['raw'], row['refined'], dim, accent)}</p>",
             ]
+        if row["final"] is not None and row["final"] != pasted:
+            heading = "Your correction" if row["final_source"] == "explicit"                 else "What you changed it to"
+            html += [
+                f'<p style="font-weight:600; margin-top:14px">{heading}</p>',
+                f"<p>{_diff_html(pasted, row['final'], dim, accent, key=str)}</p>",
+            ]
         if row["app_title"]:
             html.append(f'<p style="color:{dim}; margin-top:14px">'
                         f'Window: {escape(row["app_title"])}</p>')
@@ -250,6 +264,31 @@ class HistoryScreen(QWidget):
         if row is None:
             return
         QGuiApplication.clipboard().setText(row["refined"] or row["raw"])
+
+    def _correct_selected(self) -> None:
+        """Ask what the dictation should have said. The strongest correction signal
+        there is, so it outranks anything read back from the text box."""
+        row = self._selected_row()
+        if row is None:
+            return
+        current = row["final"] or row["refined"] or row["raw"]
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Correct this dictation", "What should it have said?", current)
+        if not ok or not text.strip() or text == current:
+            return
+        self._store.set_final(int(row["id"]), text, "explicit")
+        # The model's own dict, so the selection survives without a reload.
+        row["final"], row["final_source"] = text, "explicit"
+        self._show_detail()
+
+    def correct_latest(self) -> None:
+        """Select the newest dictation and open the correction dialog on it."""
+        self.reload()
+        self._search.clear()
+        self._table.sortByColumn(0, Qt.DescendingOrder)
+        if self._proxy.rowCount():
+            self._table.setCurrentIndex(self._proxy.index(0, 0))
+            self._correct_selected()
 
     def _delete_selected(self) -> None:
         row = self._selected_row()

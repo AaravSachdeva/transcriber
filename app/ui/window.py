@@ -120,3 +120,9 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    def fix_last(self) -> None:
+        """The "that was wrong" entry point: History, newest dictation, correction open."""
+        self.show_and_raise()
+        self._nav.setCurrentRow(0)
+        self.history.correct_latest()

@@ -16,12 +16,13 @@ from pathlib import Path
 
 import numpy as np
 
+from app.capture import _matches, locate, track
 from app.commands import TOKEN, rewrite, slash_command
 from app.controller import normalize_trigger
 from app.ui.history import _diff_html
 from app.hotkey import Dictation, HoldToggleHotkey
 from app.llm import looks_sane
-from app.store import Store, seconds_saved, wpm
+from app.store import SCHEMA, Store, seconds_saved, wpm
 from app.transcription import MAX_PROMPT_CHARS, LiveTranscript, build_initial_prompt, tidy
 from app.winctx import Foreground, foreground
 
@@ -440,6 +441,124 @@ def test_vad_scores_silence_low() -> None:
     probs = live._score(np.zeros((3, 512), np.float32))
     live.close()
     assert probs.shape == (3,) and (probs < 0.5).all(), probs
+
+
+def test_locate_insertion() -> None:
+    assert locate("", "Hello there.", "Hello there.") == (0, 12)
+    before, pasted = "Hi Sam. Thanks.", "See you at 10. "
+    after = before.replace("Thanks.", pasted + "Thanks.")
+    start, end = locate(before, after, pasted)
+    assert after[start:end] == pasted, after[start:end]
+    # Pasted over a similar selection: the bare difference is one "r", not the paste.
+    start, end = locate("Send it tomorow please", "Send it tomorrow please", "tomorrow")
+    assert "Send it tomorrow please"[start:end] == "tomorrow"
+    # The app changed the paste (an accepted mention): the box's version is the span.
+    after = "@Rahul Sharma can you check"
+    start, end = locate("", after, "@Rahul can you check")
+    assert after[start:end] == after and _matches(after, "@Rahul can you check")
+    assert not _matches("something else entirely", "@Rahul can you check")
+
+
+def test_track_region() -> None:
+    """Edits inside the pasted span are the correction; typing at its edges is not."""
+    box = "Hi Sam. See you at ten. Thanks."
+    span = (box.index("See"), box.index("Thanks."))
+
+    fixed = box.replace("ten", "10")
+    start, end = track(box, fixed, *span)
+    assert fixed[start:end] == "See you at 10. "
+
+    typed_after = box.replace("Thanks.", "Bring the doc. Thanks.")
+    start, end = track(box, typed_after, *span)
+    assert typed_after[start:end] == "See you at ten. "
+
+    typed_before = "Hello! " + box
+    start, end = track(box, typed_before, *span)
+    assert typed_before[start:end] == "See you at ten. "
+
+    assert track(box, "", *span) is None                                # sent, or cleared
+    assert track(box, box.replace("Sam. See", "Sam, see"), *span) is None  # crosses an edge
+
+    # The case that matters most: fix the last word, then keep typing, polls apart.
+    prev, span = "Hello wrold", (0, 11)
+    for cur in ("Hello world", "Hello world. And more"):
+        span = track(prev, cur, *span)
+        prev = cur
+    assert prev[span[0]:span[1]] == "Hello world"
+
+
+def test_store_migrates_old_schema() -> None:
+    """A history.db from before corrections keeps its rows and gains the new columns."""
+    import sqlite3
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "h.db"
+        old = sqlite3.connect(path)
+        old.executescript(SCHEMA)
+        old.execute("INSERT INTO dictations (ts, raw, audio_s, words) "
+                    "VALUES ('2026-01-01T00:00:00+00:00', 'hi', 1.0, 1)")
+        old.commit()
+        old.close()
+
+        store = Store(path)
+        [row] = store.recent()
+        assert row["raw"] == "hi" and row["final"] is None and row["is_edit"] == 0
+        store.add(raw="make it formal", refined="Dear Sam,", audio_s=1.0, app_exe=None,
+                  app_title=None, context=None, is_edit=True)
+        assert store.recent()[0]["is_edit"] == 1
+        store.close()
+        Store(path).close()  # opening an already migrated database is a no-op
+
+
+def test_explicit_correction_beats_implicit() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(Path(tmp) / "h.db")
+        row_id = store.add(raw="send it tuesday", refined="Send it Tuesday.", audio_s=1.0,
+                           app_exe=None, app_title=None, context=None)
+        store.set_final(row_id, "Send it Thursday.", "explicit")
+        store.set_final(row_id, "Send it Tuesday.", "unedited")  # read back later
+        [correction] = store.corrections()
+        assert correction["final"] == "Send it Thursday.", correction
+        assert correction["weight"] == 1.0
+        store.set_final(row_id, "Send it on Thursday.", "explicit")  # a later fix wins
+        assert store.corrections()[0]["final"] == "Send it on Thursday."
+        store.close()
+
+
+def test_store_audio_roundtrip() -> None:
+    import wave
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(Path(tmp) / "h.db")
+        row_id = store.add(raw="hi", refined=None, audio_s=0.5, app_exe=None,
+                           app_title=None, context=None)
+        store.save_audio(row_id, np.full(8000, 0.5, np.float32), 16000)
+        with wave.open(str(store.audio_path(row_id))) as w:
+            assert (w.getnframes(), w.getframerate(), w.getsampwidth()) == (8000, 16000, 2)
+        store.delete(row_id)
+        assert not store.audio_path(row_id).exists()
+        store.close()
+
+
+def test_field_read_never_raises() -> None:
+    """Whatever has focus, reading it back gives text or None. On its own thread, as in
+    the app: the clipboard test has made the main thread Qt's."""
+    import threading
+
+    from app import capture
+
+    out = []
+
+    def read() -> None:
+        uia = capture._Uia()
+        element = uia.focused()
+        out.append(capture._text(element) if element else None)
+        capture._release(element)
+
+    thread = threading.Thread(target=read)
+    thread.start()
+    thread.join(10)
+    assert out and (out[0] is None or isinstance(out[0], str)), out
 
 
 def main() -> int:

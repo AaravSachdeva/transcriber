@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import wave
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from loguru import logger
 
 from .config import DB_PATH
@@ -34,6 +36,18 @@ CREATE TABLE IF NOT EXISTS dictations (
 );
 CREATE INDEX IF NOT EXISTS dictations_ts ON dictations(ts);
 """
+
+# Columns added after the first release. Added on open when missing, so an existing
+# history.db gains them without losing rows.
+# final:        what the text ended up as after the user saw it
+# final_source: 'explicit' (corrected in History), 'implicit' (read back from the text
+#               box), 'unedited' (read back, not changed), or NULL (not known)
+# is_edit:      a selection edit, whose raw is a spoken instruction, not a transcript
+ADDED_COLUMNS = ("final TEXT", "final_source TEXT", "is_edit INTEGER NOT NULL DEFAULT 0")
+
+# How much a final text counts as a correction. A deliberate fix is the clean signal.
+# Unedited is weak approval only: people leave small errors alone.
+SIGNAL_WEIGHT = {"explicit": 1.0, "implicit": 0.5, "unedited": 0.1}
 
 # Typing speed assumed when estimating time saved. Deliberately conservative: a higher
 # baseline would inflate the number.
@@ -69,6 +83,10 @@ class Store:
         self._local = threading.local()
         with self._conn() as conn:
             conn.executescript(SCHEMA)
+            have = {r["name"] for r in conn.execute("PRAGMA table_info(dictations)")}
+            for column in ADDED_COLUMNS:
+                if column.split()[0] not in have:
+                    conn.execute(f"ALTER TABLE dictations ADD COLUMN {column}")
         logger.info(f"History database at {self._path}")
 
     def _conn(self) -> sqlite3.Connection:
@@ -90,6 +108,7 @@ class Store:
         context: Optional[str],
         asr_ms: Optional[int] = None,
         llm_ms: Optional[int] = None,
+        is_edit: bool = False,
     ) -> int:
         text = refined or raw
         conn = self._conn()
@@ -97,14 +116,45 @@ class Store:
             cur = conn.execute(
                 "INSERT INTO dictations "
                 "(ts, app_exe, app_title, context, raw, refined, audio_s, words, "
-                " asr_ms, llm_ms) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " asr_ms, llm_ms, is_edit) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     app_exe, app_title, context, raw, refined, audio_s,
-                    len(text.split()), asr_ms, llm_ms,
+                    len(text.split()), asr_ms, llm_ms, int(is_edit),
                 ),
             )
         return int(cur.lastrowid)
+
+    def set_final(self, row_id: int, text: str, source: str) -> None:
+        """Record what a dictation ended up as. Called from the capture thread as well
+        as the GUI. Read-back never overwrites a correction the user made by hand."""
+        conn = self._conn()
+        with conn:
+            conn.execute(
+                "UPDATE dictations SET final = ?, final_source = ? WHERE id = ? "
+                "AND (? = 'explicit' OR final_source IS NOT 'explicit')",
+                (text, source, row_id, source),
+            )
+
+    def corrections(self) -> list[dict]:
+        """Every dictation whose final text is known, oldest first, with its weight."""
+        rows = self._conn().execute(
+            "SELECT * FROM dictations WHERE final_source IS NOT NULL ORDER BY ts"
+        ).fetchall()
+        return [{**dict(r), "weight": SIGNAL_WEIGHT[r["final_source"]]} for r in rows]
+
+    def audio_path(self, row_id: int) -> Path:
+        return self._path.parent / "audio" / f"{row_id}.wav"
+
+    def save_audio(self, row_id: int, data: np.ndarray, sample_rate: int) -> None:
+        """Keep a dictation's recording as 16-bit mono WAV, named by its history id."""
+        path = self.audio_path(row_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(sample_rate)
+            out.writeframes((np.clip(data, -1.0, 1.0) * 32767).astype("<i2").tobytes())
 
     def recent(self, limit: int = 500) -> list[sqlite3.Row]:
         return self._conn().execute(
@@ -142,6 +192,7 @@ class Store:
         conn = self._conn()
         with conn:
             conn.execute("DELETE FROM dictations WHERE id = ?", (row_id,))
+        self.audio_path(row_id).unlink(missing_ok=True)
 
     def close(self) -> None:
         """Close this thread's connection. Other threads keep theirs; they are closed

@@ -98,6 +98,8 @@ tray; quit from the tray menu.
 
 - **History** — every dictation, searchable, with the raw transcript beside what was
   actually pasted, and per-stage timings. Useful when a paste went somewhere unexpected.
+  **Correct...** records what a dictation should have said. **Fix last dictation...** in
+  the tray menu opens it on the latest one.
 - **Stats** — words dictated, speaking rate, estimated time saved, and words per day.
 - **Vocabulary** — names, jargon and product terms, fed to Whisper so it spells them
   correctly. Also snippets: say a trigger phrase, get a canned block of text.
@@ -105,7 +107,22 @@ tray; quit from the tray menu.
   below which the LLM is skipped, the hold threshold, and autostart at login.
 
 Settings live in `%APPDATA%\transcriber\settings.json`, history in
-`%APPDATA%\transcriber\history.db`, logs in `%APPDATA%\transcriber\transcriber.log`.
+`%APPDATA%\transcriber\history.db`, kept recordings in `%APPDATA%\transcriber\audio\`,
+logs in `%APPDATA%\transcriber\transcriber.log`.
+
+### Learning from corrections
+
+After a paste, Transcriber reads the text box you dictated into for up to a minute, through
+Windows UI Automation. It follows the pasted text while you edit it. Text you type before
+or after the pasted text is ignored. When you leave the box, it records what the pasted
+text became. Only that part is stored, never the rest of the box. A correction you make in
+History always outranks one read back from the box. Apps that expose no readable text
+(some Electron editors, elevated windows) simply record nothing. The log says which apps
+could be read.
+
+To turn this off, clear **Learn from my corrections** in Settings. **Keep recordings of
+my voice** is off by default. When it is on, each dictation's audio is saved as a WAV
+file next to the history.
 
 The tray icon shows the current state: grey idle, red recording, green transcribing, amber
 a problem.

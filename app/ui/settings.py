@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 
 from . import theme
 from .. import autostart
-from ..config import AppConfig, SETTINGS_PATH
+from ..config import AppConfig, DB_PATH, SETTINGS_PATH
 from ..hotkey import MIN_HOLD_THRESHOLD_MS
 from ..transcription import SAMPLE_RATE
 
@@ -172,6 +172,19 @@ class SettingsScreen(QWidget):
             "recording on until you tap again. Raise the settle delay if a slow app "
             "ever pastes truncated text.")
 
+        # --- learning ---
+        section("Learning")
+        self._learn = QCheckBox("Learn from my corrections")
+        self._learn.setChecked(cfg.learn_from_corrections)
+        self._keep_audio = QCheckBox("Keep recordings of my voice")
+        self._keep_audio.setChecked(cfg.keep_audio)
+        form.addRow("", self._learn)
+        form.addRow("", self._keep_audio)
+        note(
+            "After a paste, Transcriber reads the text box you dictated into for up to a "
+            "minute and keeps only the part it pasted, as you left it. Recordings are "
+            f"saved in {DB_PATH.parent / 'audio'}. Nothing leaves this computer.")
+
         # Sections scroll; the title and the Save row stay put.
         sections = QWidget()
         sections_layout = QVBoxLayout(sections)
@@ -228,6 +241,8 @@ class SettingsScreen(QWidget):
 
         cfg.hotkey.hold_threshold_ms = self._hold.value()
         cfg.paste_settle_ms = self._settle.value()
+        cfg.learn_from_corrections = self._learn.isChecked()
+        cfg.keep_audio = self._keep_audio.isChecked()
 
         wanted = self._autostart.isChecked()
         if wanted != autostart.is_enabled():
