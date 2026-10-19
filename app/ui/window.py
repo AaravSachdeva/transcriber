@@ -97,6 +97,8 @@ class MainWindow(QMainWindow):
             self.stats.reload()
         elif self._stack.currentWidget() is self.history:
             self.history.reload()
+        elif self._stack.currentWidget() is self.settings:
+            self.settings.reload_models()
 
     def _on_state(self, state: State) -> None:
         self._dot.setPixmap(dot_icon(STATE_COLOURS[state]).pixmap(14, 14))

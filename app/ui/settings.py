@@ -25,6 +25,8 @@ from ..transcription import SAMPLE_RATE
 
 WHISPER_MODELS = [
     "distil-large-v3", "large-v3-turbo", "large-v3", "medium", "small", "base",
+    # The CPU tiers the hardware test can pick (app/autosetup.py).
+    "small.en", "base.en",
 ]
 COMPUTE_TYPES = ["int8_float16", "int8", "float16"]
 DEVICES = ["auto", "cuda", "cpu"]
@@ -123,8 +125,6 @@ class SettingsScreen(QWidget):
         self._llm_enabled.setChecked(cfg.ollama.enabled)
         self._llm_model = QComboBox()
         self._llm_model.setEditable(True)
-        available = ollama_models(cfg.ollama.base_url)
-        self._llm_model.addItems(available or [cfg.ollama.model])
         self._llm_model.setCurrentText(cfg.ollama.model)
         self._threshold = QSpinBox()
         self._threshold.setRange(0, 100)
@@ -145,8 +145,10 @@ class SettingsScreen(QWidget):
         form.addRow("", self._context_formatting)
         note(
             "Transcripts shorter than the skip threshold are pasted straight away, so "
-            "short replies stay instant. A smaller context size uses less VRAM."
-            + ("" if available else " Ollama is not reachable, so the model list is empty."))
+            "short replies stay instant. A smaller context size uses less VRAM.")
+        self._ollama_down = theme.label(
+            "Ollama is not reachable, so only the current model is listed.", "Caption", wrap=True)
+        form.addRow(self._ollama_down)
 
         # --- behaviour ---
         section("Behaviour")
@@ -218,6 +220,19 @@ class SettingsScreen(QWidget):
         layout.addWidget(title)
         layout.addWidget(scroll, 1)
         layout.addLayout(footer)
+        # After the layouts are installed: shown while still parentless, a label is a window.
+        self.reload_models()
+
+    def reload_models(self) -> None:
+        """Fill the LLM list from Ollama. Called again each time Settings is opened: this
+        screen is built at launch, before the controller has started Ollama, and a list
+        fetched only then held nothing but the current model."""
+        current = self._llm_model.currentText()
+        available = ollama_models(self._cfg.ollama.base_url)
+        self._llm_model.clear()
+        self._llm_model.addItems(available or [current])
+        self._llm_model.setCurrentText(current)
+        self._ollama_down.setVisible(not available)
 
     @staticmethod
     def _select_data(combo: QComboBox, value) -> None:

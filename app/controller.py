@@ -57,7 +57,9 @@ class Controller(QObject):
     # Emitted from the pynput listener thread; queued onto the GUI thread by Qt.
     _startRequested = Signal(bool)    # is_edit
     _stopRequested = Signal()
-    _workerFinished = Signal(object)  # dict payload, or None when nothing to paste
+    _cancelRequested = Signal()
+    _shortcutRequested = Signal()
+    _workerFinished = Signal(object)  # (generation, dict payload or None)
 
     def __init__(self, cfg: AppConfig, store: Store) -> None:
         super().__init__()
@@ -77,10 +79,15 @@ class Controller(QObject):
         self._hotkey = HoldToggleHotkey(
             on_start=lambda is_edit: self._startRequested.emit(is_edit),
             on_stop=lambda: self._stopRequested.emit(),
+            on_cancel=lambda: self._cancelRequested.emit(),
+            on_shortcut=lambda: self._shortcutRequested.emit(),
             hold_threshold_ms=cfg.hotkey.hold_threshold_ms,
         )
 
         self._state = State.IDLE
+        # Bumped by cancel(). A worker still running for a cancelled dictation reports
+        # an older generation, and its result is dropped.
+        self._gen = 0
         # Captured when recording starts, because that is when the user was looking at
         # the target window. By the time text is pasted the focus is the same, but the
         # selection for an edit must be read before the user does anything else.
@@ -90,6 +97,8 @@ class Controller(QObject):
 
         self._startRequested.connect(self._on_start)
         self._stopRequested.connect(self._on_stop)
+        self._cancelRequested.connect(self.cancel)
+        self._shortcutRequested.connect(self._on_shortcut)
         self._workerFinished.connect(self._on_worker_finished)
 
     # --- lifecycle ---
@@ -219,13 +228,37 @@ class Controller(QObject):
             # Read the text box now, while Whisper runs, so the paste can be found in it.
             self._watcher.before(self._foreground)
         threading.Thread(
-            target=self._work, args=(self._live, recorded, self._is_edit, self._selection,
-                                     self._foreground), daemon=True,
+            target=self._work, args=(self._gen, self._live, recorded, self._is_edit,
+                                     self._selection, self._foreground), daemon=True,
         ).start()
+
+    @Slot()
+    def cancel(self) -> None:
+        """Esc or the overlay's ×: drop this dictation. Nothing is pasted or logged."""
+        if self._state == State.RECORDING:
+            try:
+                self._recorder.stop()
+            except Exception as exc:
+                logger.exception(f"Could not stop recording: {exc}")
+            self._live.close()
+        elif self._state != State.PROCESSING:
+            return
+        # Processing: the worker runs on, and _on_worker_finished drops its result.
+        self._gen += 1
+        self._hotkey.unlatch()
+        self._set_state(State.IDLE)
+        self.statusMessage.emit("Cancelled.")
+
+    @Slot()
+    def _on_shortcut(self) -> None:
+        """Right Ctrl was a shortcut. Its start was refused if a dictation was already
+        processing, and that dictation must still be pasted."""
+        if self._state == State.RECORDING:
+            self.cancel()
 
     # --- worker thread ---
 
-    def _work(self, live: LiveTranscript, recorded: RecordedAudio, is_edit: bool,
+    def _work(self, gen: int, live: LiveTranscript, recorded: RecordedAudio, is_edit: bool,
               selection: str, fg: Optional[winctx.Foreground]) -> None:
         """Transcribe, then refine or edit. No Qt widget and no clipboard here."""
         payload: Optional[dict] = None
@@ -253,7 +286,7 @@ class Controller(QObject):
             logger.exception(f"Dictation pipeline failed: {exc}")
             payload = {"error": f"{type(exc).__name__}: {exc}"}
         finally:
-            self._workerFinished.emit(payload)
+            self._workerFinished.emit((gen, payload))
 
     def _refine(self, raw: str, asr_ms: int, audio_s: float,
                 fg: Optional[winctx.Foreground]) -> dict:
@@ -281,15 +314,19 @@ class Controller(QObject):
 
         context = fg.context if (fg and self.cfg.context_formatting) else None
         refined, llm_ms = self._ollama.refine(text, context)
-        # refined is its input when the model was unavailable or its output was
-        # rejected; llm_ms is None in exactly those cases, so it doubles as the flag.
+        # refined is its input when the model was unavailable or the request failed;
+        # llm_ms is None in exactly those cases, so it doubles as the flag.
         return {**base, "text": refined,
                 "refined": refined if llm_ms is not None else rewritten, "llm_ms": llm_ms}
 
     # --- back on the GUI thread ---
 
     @Slot(object)
-    def _on_worker_finished(self, payload: Optional[dict]) -> None:
+    def _on_worker_finished(self, result: tuple[int, Optional[dict]]) -> None:
+        gen, payload = result
+        if gen != self._gen:
+            logger.info("Cancelled dictation finished; discarding it.")
+            return
         if payload is None or "error" in payload:
             message = (payload or {}).get("error", "Dictation failed.")
             self._set_state(State.ERROR)

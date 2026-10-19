@@ -54,30 +54,54 @@ You can set two knobs in `settings.json`:
 - `mention_popup_ms` is how long to wait for the popup (default 400). Raise it if a slow
   app accepts nothing.
 
-## Requirements
+## Install
 
-- Windows 10 or 11
-- Python 3.11 or newer, and [uv](https://docs.astral.sh/uv/)
-- An NVIDIA GPU is strongly recommended. Whisper falls back to CPU automatically, but
-  dictation then takes tens of seconds rather than a few.
-- [Ollama](https://ollama.com/) for the cleanup pass. It is optional — without it you get
-  the raw Whisper transcript, which is already punctuated.
+Download `TranscriberSetup.exe` and double-click it. There are no questions to answer.
+Setup installs for your user only, so it needs no administrator rights. Then it:
 
-## Setup
+1. Downloads Python and the app's components into
+   `%LOCALAPPDATA%\Programs\Transcriber`. This is up to 3 GB, and more on a PC with an
+   NVIDIA GPU, because only that PC gets the CUDA libraries.
+2. Tests your hardware. It reads the GPU, VRAM, RAM and CPU, and picks the best models
+   they should run. Then it tries them for real: the Windows voice says a test sentence,
+   Whisper transcribes it, and the LLM cleans up a sample. A model that is inaccurate,
+   too slow, or does not fit on the GPU is dropped for the next smaller one. Ollama is
+   installed silently if it is missing. On a PC too small for any LLM, the app pastes the
+   raw Whisper transcript, which is already punctuated.
+3. Starts Transcriber, and sets it to start at every login, straight to the tray.
+
+The setup is unsigned, so Windows SmartScreen may say "Windows protected your PC". Click
+**More info**, then **Run anyway**.
+
+Running setup again updates the app. It keeps your settings and does not rerun the test.
+To rerun the test, for example after a GPU upgrade, quit the app from the tray and run:
 
 ```powershell
-uv sync
+& "$env:LOCALAPPDATA\Programs\Transcriber\.venv\Scripts\transcriber.exe" --setup --force
+```
+
+Requirements: Windows 10 or 11, 64-bit, and an internet connection during setup.
+
+## Development
+
+Needs Python 3.11 or newer and [uv](https://docs.astral.sh/uv/).
+
+```powershell
+uv sync --extra cuda      # leave out --extra cuda on a PC without an NVIDIA GPU
 ollama pull qwen3:1.7b
 uv run python -m app.main
 ```
 
 The first launch downloads the Whisper model (about 1.5 GB) into the HuggingFace cache.
 
-### Choosing models for your GPU
+To build the installer, install [Inno Setup 6](https://jrsoftware.org/isinfo.php)
+(`winget install JRSoftware.InnoSetup`), then run `installer\build.ps1`. It writes
+`dist\TranscriberSetup.exe`.
 
-VRAM is usually the constraint, because Whisper and the refinement model have to fit
-alongside each other and alongside the Windows desktop. `bench.py` measures your actual
-hardware:
+### Choosing models by hand
+
+Setup picks the models automatically. To compare them on your own voice, `bench.py`
+measures your actual hardware:
 
 ```powershell
 uv run python bench.py

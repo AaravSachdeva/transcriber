@@ -3,26 +3,23 @@
 Two jobs: tidy a dictated transcript, and apply a spoken instruction to selected text.
 
 The refinement model is small (1.7B to 3B), which shapes everything here. Small models
-follow short prompts far better than long ones, and they are prone to *answering* the
-dictation instead of editing it. `looks_sane` is the defense: anything that smells like an
-answer, a refusal or a ramble is discarded in favour of the raw transcript. Pasting the
-raw transcript is a mild annoyance; pasting a chatbot reply into the user's document is
-not.
+follow short prompts far better than long ones.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 import time
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 import requests
 from loguru import logger
 
-from .commands import TOKEN
 from .config import OllamaConfig
 from . import winctx
 
@@ -80,86 +77,13 @@ EDIT_EXAMPLES = (
      "We shipped v2 late, but users liked it."),
 )
 
-# Openings that mean the model is talking to the user instead of editing.
-_CHATTY = re.compile(
-    r"^\s*(sure|certainly|of course|here('s| is)|i've|i have|okay|ok|understood|"
-    r"as an ai|i can(not|'t)|i'm sorry|sorry,|note:|revised|edited|output:|result:)\b",
-    re.IGNORECASE,
-)
 # qwen3 and friends can leak a reasoning block even with thinking disabled.
 _THINK_BLOCK = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 
-# Words that open a question. Used to catch the model answering a dictated question
-# instead of tidying it, which no length or wording check can see: "what's the capital
-# of France" answered as "The capital of France is Paris." reuses nearly every word.
-_INTERROGATIVE = re.compile(
-    r"^\s*(who|what|whats|when|where|why|how|which|whose|can|could|would|should|"
-    r"is|are|was|were|do|does|did|will|shall|may|might|have|has|am)\b",
-    re.IGNORECASE,
-)
-
-
-def _is_question(text: str) -> bool:
-    return text.rstrip().endswith("?") or bool(_INTERROGATIVE.match(text))
-
-
-# Words for counting and comparing. Bullets and the @ of a mention are not words.
-_WORD = re.compile(r"[a-z0-9']+")
-
-
-def _structure(text: str) -> tuple[list[str], int, bool]:
-    """The parts the model must not touch: mentions, channels, line breaks, and a
-    leading slash, which it was seen inventing ("rewrite this" -> "/rewrite this")."""
-    return sorted(TOKEN.findall(text)), text.count("\n"), text.lstrip().startswith("/")
-
-
-def looks_sane(raw: str, refined: str) -> bool:
-    """Is `refined` plausibly an edit of `raw`, rather than an answer to it?
-
-    Cleanup removes filler, so shrinking is expected and shrinking a lot is fine.
-    Growing substantially is not: that is the model adding its own words.
-    """
-    if not refined:
-        return False
-    if _CHATTY.match(refined):
-        logger.warning(f"Refinement rejected: conversational opening {refined[:50]!r}")
-        return False
-    if _is_question(raw) and not _is_question(refined):
-        # A question that came back as a statement was answered, not edited. Rejecting
-        # costs a fallback to the raw transcript; accepting pastes a chatbot reply into
-        # the user's document.
-        logger.warning(f"Refinement rejected: question answered rather than edited: {refined[:50]!r}")
-        return False
-    if _structure(raw) != _structure(refined):
-        # A dropped mention or a moved line break changes what the paste does, not
-        # just how it reads.
-        logger.warning(f"Refinement rejected: mentions, line breaks or slash changed: {refined[:50]!r}")
-        return False
-
-    raw_words, refined_words = _WORD.findall(raw.lower()), _WORD.findall(refined.lower())
-    if not raw_words:
-        return False
-    ratio = len(refined_words) / len(raw_words)
-    # Floor at 0.4 catches a model that summarised instead of editing. Ceiling at 1.6
-    # allows expanded contractions and spelled-out numbers, but not an essay.
-    if not 0.4 <= ratio <= 1.6:
-        logger.warning(
-            f"Refinement rejected: {len(raw_words)} words in, {len(refined_words)} out "
-            f"(ratio {ratio:.2f})"
-        )
-        return False
-    # Most of the output must be the speaker's own words. A length ratio cannot see a
-    # model that echoed its example instead: "I see I see I see" once came back as
-    # "send it Tuesday", ratio 0.5, not one word shared.
-    spoken = set(raw_words)
-    shared = sum(w in spoken for w in refined_words) / len(refined_words)
-    if shared < 0.5:
-        logger.warning(f"Refinement rejected: only {shared:.0%} of its words were spoken: {refined[:50]!r}")
-        return False
-    return True
-
 
 _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+# Where the official per-user installer puts it.
+OLLAMA_EXE = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe"
 
 
 class OllamaClient:
@@ -196,7 +120,9 @@ class OllamaClient:
     def _start_server(self) -> None:
         """Start a local Ollama once, when it is installed but not running. Without this
         the LLM went silently unused for a whole afternoon of dictation."""
-        exe = shutil.which("ollama")
+        # A just-installed Ollama is not on the PATH this process inherited, which is
+        # the case for the installer's hardware test and the first launch after it.
+        exe = shutil.which("ollama") or (str(OLLAMA_EXE) if OLLAMA_EXE.exists() else None)
         if self._spawned or not exe or urlparse(self._cfg.base_url).hostname not in _LOCAL_HOSTS:
             return
         self._spawned = True
@@ -213,12 +139,17 @@ class OllamaClient:
         """Load the model while the user is still speaking. An empty generate request
         only loads it; a cold load was 4-6 seconds in the latency path otherwise.
 
-        Runs on its own thread, so a plain request rather than the shared session."""
+        Runs on its own thread, so a plain request rather than the shared session.
+
+        num_ctx must match _chat's. Ollama reloads a model whose context size changes, so
+        warming at its default (4096) reloaded it here and again at 2048 in _chat: about
+        4 seconds in the latency path of every dictation, measured."""
         if not (self._cfg.enabled and self.is_available()):
             return
         try:
             requests.post(f"{self._cfg.base_url}/api/generate",
-                          json={"model": self._cfg.model, "keep_alive": self._cfg.keep_alive},
+                          json={"model": self._cfg.model, "keep_alive": self._cfg.keep_alive,
+                                "options": {"num_ctx": self._cfg.num_ctx}},
                           timeout=self._cfg.timeout_seconds)
         except Exception as exc:
             logger.debug(f"Ollama warm-up failed (not fatal): {exc}")
@@ -283,8 +214,6 @@ class OllamaClient:
 
         if refined is None:
             return transcript, None
-        if not looks_sane(transcript, refined):
-            return transcript, None
         return refined, elapsed_ms
 
     def close(self) -> None:
@@ -302,8 +231,5 @@ class OllamaClient:
         elapsed_ms = int((time.perf_counter() - t0) * 1000)
 
         if edited is None:
-            return None, None
-        if _CHATTY.match(edited):
-            logger.warning(f"Edit rejected: conversational opening {edited[:50]!r}")
             return None, None
         return edited, elapsed_ms

@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 import requests
 
+from app.autosetup import residency
 # The prompt the real app uses, so the token count is representative.
 from app.llm import SYSTEM_PROMPT
 
@@ -128,22 +129,6 @@ def unload(model: str) -> None:
         pass
 
 
-def ollama_residency(model: str) -> str:
-    """GPU, PARTIAL CPU or unknown - the only reliable way to catch a silent spill."""
-    try:
-        for m in SESSION.get(f"{OLLAMA}/api/ps", timeout=5).json().get("models", []):
-            if m.get("name") == model or m.get("model") == model:
-                total, vram = m.get("size", 0), m.get("size_vram", 0)
-                if not total:
-                    return "unknown"
-                if vram >= total:
-                    return "GPU"
-                return f"PARTIAL CPU ({vram / total:.0%} on GPU)"
-    except Exception:
-        pass
-    return "unknown"
-
-
 def refine(model: str, text: str) -> tuple[str, int]:
     body = {
         "model": model,
@@ -189,7 +174,7 @@ def bench_pair(audio: np.ndarray, compute_type: str, llm: str) -> dict:
 
         try:
             refined, row["llm_ms"] = refine(llm, text)
-            row["residency"] = ollama_residency(llm)
+            row["residency"] = residency(OLLAMA, llm)
             row["refined_words"] = len(refined.split())
         except Exception as exc:
             row["llm_ms"] = -1

@@ -3,8 +3,8 @@
     uv run python test_pipeline.py
 
 Plain asserts, no framework. Covers the decisions that are easy to get wrong and hard to
-notice: hold-versus-tap, the refinement sanity guard, snippet matching, and the stats
-arithmetic, and the clipboard wait. Deliberately does not cover Whisper or Ollama - those
+notice: hold-versus-tap, spoken commands, snippet matching, the stats arithmetic, and
+the clipboard wait. Deliberately does not cover Whisper or Ollama - those
 need the real thing, and the manual checklist in the plan covers them.
 """
 
@@ -16,12 +16,12 @@ from pathlib import Path
 
 import numpy as np
 
+from app.autosetup import Hardware, candidates, heard
 from app.capture import _matches, locate, track
 from app.commands import TOKEN, rewrite, slash_command
 from app.controller import normalize_trigger
 from app.ui.history import _diff_html
 from app.hotkey import Dictation, HoldToggleHotkey
-from app.llm import looks_sane
 from app.store import SCHEMA, Store, seconds_saved, wpm
 from app.transcription import MAX_PROMPT_CHARS, LiveTranscript, build_initial_prompt, tidy
 from app.winctx import Foreground, foreground
@@ -29,6 +29,7 @@ from app.winctx import Foreground, foreground
 
 def _hotkey(threshold_ms: int = 400) -> HoldToggleHotkey:
     return HoldToggleHotkey(on_start=lambda _e: None, on_stop=lambda: None,
+                            on_cancel=lambda: None, on_shortcut=lambda: None,
                             hold_threshold_ms=threshold_ms)
 
 
@@ -108,59 +109,79 @@ def test_reset_clears_latch() -> None:
     assert k.press(2.0) == Dictation.START
 
 
-def test_sanity_guard_accepts_real_cleanup() -> None:
-    raw = "um so i think we should uh ship it on friday you know"
-    assert looks_sane(raw, "So I think we should ship it on Friday.")
+def test_unlatch_keeps_held_key() -> None:
+    """Cancel while right Ctrl is still held: auto-repeat must not start a new recording."""
+    k = _hotkey()
+    k.press(0.0)
+    k.unlatch()
+    assert k.press(0.5) == Dictation.NOTHING
+
+    k2 = _hotkey()
+    k2.press(0.0)
+    k2.release(0.1)
+    k2.unlatch()
+    assert not k2.latched
+    assert k2.press(2.0) == Dictation.START
 
 
-def test_sanity_guard_accepts_unchanged_text() -> None:
-    clean = "The deployment finished at four o'clock."
-    assert looks_sane(clean, clean)
+def test_shortcut_with_right_ctrl_is_not_dictation() -> None:
+    """Right Ctrl+C is a shortcut: cancel the recording it started, never latch."""
+    from pynput import keyboard
+
+    k = _hotkey()
+    assert k.press(0.0) == Dictation.START
+    assert k.chord() is True
+    assert k.chord() is False  # Ctrl+K, Ctrl+C in one hold cancels once
+    assert k.release(0.1) == Dictation.NOTHING and not k.latched
+    assert k.press(1.0) == Dictation.START  # the next real press still works
+
+    # During a latched dictation a shortcut neither stops nor cancels it.
+    k = _hotkey()
+    k.press(0.0); k.release(0.1)
+    assert k.latched
+    assert k.press(5.0) == Dictation.NOTHING
+    assert k.chord() is False
+    assert k.release(5.1) == Dictation.NOTHING and k.latched
+    assert k.chord() is False  # right Ctrl is up: ordinary typing
+
+    # The app's own Ctrl+C (edit mode copies the selection) is injected: ignored.
+    cancelled = []
+    k = HoldToggleHotkey(on_start=lambda _e: None, on_stop=lambda: None,
+                         on_cancel=lambda: None, on_shortcut=lambda: cancelled.append(1),
+                         hold_threshold_ms=400)
+    k._on_press(keyboard.Key.ctrl_r, False)
+    k._on_press(keyboard.KeyCode.from_char("c"), True)
+    assert cancelled == []
+    k._on_press(keyboard.KeyCode.from_char("c"), False)
+    assert cancelled == [1]
 
 
-def test_sanity_guard_rejects_conversational_openings() -> None:
-    """The model talking to the user instead of editing. The single most likely
-    failure mode of a small refinement model."""
-    raw = "can you tell me what the capital of france is please"
-    for bad in [
-        "Sure! Here is the edited text: What is the capital of France?",
-        "Here's the cleaned up version: what is the capital of France?",
-        "The capital of France is Paris.",  # answered instead of edited
-        "I'm sorry, I cannot help with that.",
-        "Okay, I have removed the filler words.",
-        "Note: the text was already clean.",
-    ]:
-        assert not looks_sane(raw, bad), bad
+def test_shortcut_never_drops_a_dictation_being_processed() -> None:
+    """Right Ctrl+C just after a dictation: its start is refused while processing, so the
+    shortcut must not cancel the dictation that is still being transcribed."""
+    from pynput import keyboard
 
+    from app.config import AppConfig
+    from app.controller import Controller, State
 
-def test_sanity_guard_rejects_rambling() -> None:
-    raw = "send the invoice tomorrow"
-    ramble = "send the invoice tomorrow " + "and also consider the following points " * 8
-    assert not looks_sane(raw, ramble)
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Store(Path(tmp) / "h.db")
+        c = Controller(AppConfig(), store)
+        try:
+            c._state, gen = State.PROCESSING, c._gen
+            c._hotkey.press(0.0)  # right Ctrl down; its queued start has not run yet
+            c._hotkey._on_press(keyboard.KeyCode.from_char("c"), False)
+            assert (c.state, c._gen) == (State.PROCESSING, gen)
 
-
-def test_sanity_guard_rejects_summarising() -> None:
-    raw = " ".join(["word"] * 40)
-    assert not looks_sane(raw, "word word")  # dropped 95%, that is a summary
-
-
-def test_sanity_guard_rejects_empty() -> None:
-    assert not looks_sane("something was said", "")
-
-
-def test_sanity_guard_rejects_example_leak() -> None:
-    """Seen in real use: the prompt's own example pasted in place of the dictation.
-    Right length, not one word the speaker said."""
-    assert not looks_sane("I see I see I see", "send it Tuesday")
-
-
-def test_sanity_guard_guards_mentions_and_line_breaks() -> None:
-    assert not looks_sane("@Rahul can you check the build today",
-                          "Can you check the build today?")
-    assert not looks_sane("first point\nsecond point here", "First point, second point here.")
-    assert not looks_sane("please rewrite this whole paragraph", "/rewrite this whole paragraph")
-    bullets = "Buy these:\n- eggs\n- bread\n- milk"
-    assert looks_sane(bullets, bullets)
+            # While recording, the same shortcut does cancel.
+            c._hotkey.reset()
+            c._state, c._live = State.RECORDING, type("Live", (), {"close": lambda s: None})()
+            c._hotkey.press(1.0)
+            c._hotkey._on_press(keyboard.KeyCode.from_char("c"), False)
+            assert c.state == State.IDLE
+        finally:
+            c.stop()
+            store.close()
 
 
 def _fg(exe: str, context: str) -> Foreground:
@@ -190,6 +211,30 @@ def test_slash_command() -> None:
         == "/ponytail ultra /caveman ultra"
     assert rewrite("slash ponytail ultra slash foo", code, _APPS, skills) \
         == "/ponytail ultra slash foo"
+
+    skills = {"ponytail", "writing-plans", "superpowers:writing-plans"}
+    assert slash_command("superpowers writing plans.", skills) == "/superpowers:writing-plans"
+    assert slash_command("superpowers", skills) == "/superpowers"  # no bare "/superpowers:"
+    assert rewrite("slash ponytail ultra slash superpowers writing plans", code, _APPS, skills) \
+        == "/ponytail ultra /superpowers:writing-plans"
+    assert rewrite("slash ponytail ultra slash superpowers foo", code, _APPS, skills) \
+        == "/ponytail ultra slash superpowers foo"
+
+
+def test_installed_skills_namespaces_plugins() -> None:
+    from app.commands import installed_skills
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for rel in ("skills/ponytail/SKILL.md",
+                    "plugins/cache/official/superpowers/7.0.0/skills/writing-plans/SKILL.md",
+                    "plugins/cache/official/superpowers/7.0.0/commands/brainstorm.md"):
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text("x")
+        names = installed_skills(root)
+        assert {"ponytail", "writing-plans", "superpowers:writing-plans",
+                "brainstorm", "superpowers:brainstorm"} <= names, names
+        assert "official:writing-plans" not in names  # marketplace is not the namespace
 
 
 def test_tidy() -> None:
@@ -358,11 +403,12 @@ def test_clipboard_restore_while_app_reads() -> None:
     import subprocess
     import sys
 
-    from PySide6.QtGui import QGuiApplication
+    # QApplication, not QGuiApplication: a later test builds widgets in this process.
+    from PySide6.QtWidgets import QApplication
 
     from app import output
 
-    app = QGuiApplication.instance() or QGuiApplication([])
+    app = QApplication.instance() or QApplication([])
     clipboard = app.clipboard()
     before = output._snapshot()
     try:
@@ -478,6 +524,12 @@ def test_track_region() -> None:
 
     assert track(box, "", *span) is None                                # sent, or cleared
     assert track(box, box.replace("Sam. See", "Sam, see"), *span) is None  # crosses an edge
+    # Sent from a box that then reads as its placeholder: gone, not rewritten to it.
+    assert track("Create a new logo.", "Describe what you want to create...\n", 0, 18) is None
+    # Backspaced away: the span follows it down and stops resembling the paste, which
+    # the watcher takes as a deletion, not a correction.
+    assert track("Looking at the users.", "Looking at", 0, 21) == (0, 10)
+    assert not _matches("Looking at", "Looking at the users.")
 
     # The case that matters most: fix the last word, then keep typing, polls apart.
     prev, span = "Hello wrold", (0, 11)
@@ -508,6 +560,29 @@ def test_store_migrates_old_schema() -> None:
         assert store.recent()[0]["is_edit"] == 1
         store.close()
         Store(path).close()  # opening an already migrated database is a no-op
+
+
+def test_store_drops_blank_implicit_finals() -> None:
+    """An old capture bug stored '\\n' as the user's correction. Opening clears it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "h.db"
+        store = Store(path)
+        ids = [store.add(raw=f"r{i}", refined=None, audio_s=1.0, app_exe=None,
+                         app_title=None, context=None) for i in range(4)]
+        store.set_final(ids[0], "\n", "implicit")
+        store.set_final(ids[1], "Kept fix.", "implicit")
+        store.set_final(ids[2], " ", "explicit")
+        store.set_final(ids[3], "\r\n", "unedited")
+        store.close()
+
+        store = Store(path)
+        finals = {r["id"]: (r["final"], r["final_source"]) for r in store.recent()}
+        assert finals[ids[0]] == (None, None)
+        assert finals[ids[1]] == ("Kept fix.", "implicit")
+        assert finals[ids[2]] == (" ", "explicit")
+        assert finals[ids[3]] == ("\r\n", "unedited")
+        store.close()
+        Store(path).close()  # a second open is a no-op
 
 
 def test_explicit_correction_beats_implicit() -> None:
@@ -559,6 +634,57 @@ def test_field_read_never_raises() -> None:
     thread.start()
     thread.join(10)
     assert out and (out[0] is None or isinstance(out[0], str)), out
+
+
+def test_autosetup_candidates() -> None:
+    """Hardware maps to the right tiers, best first, and a small PC gets no LLM."""
+    whisper, llms = candidates(Hardware("RTX 3050 Laptop", 4096, True, 16000, 16))
+    assert whisper[0] == ("distil-large-v3", "cuda", "int8_float16"), whisper
+    assert whisper[-1] == ("base.en", "cpu", "int8"), "CPU tiers are the fallback"
+    assert llms == ["qwen3:1.7b"], llms
+
+    whisper, llms = candidates(Hardware("RTX 4070", 12282, True, 32000, 20))
+    assert whisper[0] == ("distil-large-v3", "cuda", "float16") and llms[0] == "qwen3:4b"
+
+    # An NVIDIA card whose CUDA libraries do not load is a CPU-only PC.
+    whisper, llms = candidates(Hardware("RTX 4070", 12282, False, 16000, 8))
+    assert all(device == "cpu" for _m, device, _c in whisper) and llms == ["qwen3:1.7b"]
+
+    assert candidates(Hardware(None, 0, False, 7900, 4))[1] == ["qwen3:1.7b"]
+    assert candidates(Hardware(None, 0, False, 4000, 4))[1] == []
+
+    assert heard("Please move the design review to Thursday afternoon and send the notes "
+                 "to the whole team.") == 1.0
+    assert heard("") == 0.0
+
+
+def test_settings_lists_models_once_ollama_is_up() -> None:
+    """Ollama is still starting when Settings is built; reopening must list its models,
+    keep the chosen one, and let a different one be saved."""
+    from PySide6.QtWidgets import QApplication
+    from app.config import AppConfig
+    from app.ui import settings
+
+    app = QApplication.instance() or QApplication([])
+    up = []
+    real, settings.ollama_models = settings.ollama_models, lambda _url: list(up)
+    try:
+        cfg = AppConfig()
+        cfg.ollama.model = "gemma2:2b"
+        screen = settings.SettingsScreen(cfg)
+        combo = screen._llm_model
+        assert [combo.itemText(i) for i in range(combo.count())] == ["gemma2:2b"]
+        assert not screen._ollama_down.isWindow(), "the note popped out as its own window"
+
+        up[:] = ["gemma2:2b", "qwen3:1.7b"]
+        screen.reload_models()
+        assert [combo.itemText(i) for i in range(combo.count())] == up
+        assert combo.currentText() == "gemma2:2b" and screen._ollama_down.isHidden()
+
+        combo.setCurrentIndex(1)
+        assert combo.currentText() == "qwen3:1.7b"
+    finally:
+        settings.ollama_models = real
 
 
 def main() -> int:

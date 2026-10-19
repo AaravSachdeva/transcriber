@@ -58,19 +58,21 @@ _FORMATTING = [
 
 
 @lru_cache(maxsize=1)
-def installed_skills() -> frozenset[str]:
+def installed_skills(root: Path = Path.home() / ".claude") -> frozenset[str]:
     """Claude Code skill and command names, lowercased, from the user's ~/.claude.
+    A plugin's also come namespaced, "superpowers:writing-plans", as Claude Code types them.
 
     ponytail: read once per run, so a newly installed skill needs an app restart, and a
     project's own .claude/skills is not scanned because the workspace path is unknown.
     """
-    root = Path.home() / ".claude"
-    skills = [*root.glob("skills/*/SKILL.md"),
-              *root.glob("plugins/cache/*/*/*/skills/*/SKILL.md")]
-    commands = [*root.glob("commands/*.md"),
-                *root.glob("plugins/cache/*/*/*/commands/*.md")]
-    return frozenset(n.lower() for n in
-                     [p.parent.name for p in skills] + [p.stem for p in commands])
+    names = [p.parent.name for p in root.glob("skills/*/SKILL.md")]
+    names += [p.stem for p in root.glob("commands/*.md")]
+    # plugins/cache/<marketplace>/<plugin>/<version>/skills/<skill>/SKILL.md
+    for p in root.glob("plugins/cache/*/*/*/skills/*/SKILL.md"):
+        names += [p.parent.name, f"{p.parents[3].name}:{p.parent.name}"]
+    for p in root.glob("plugins/cache/*/*/*/commands/*.md"):
+        names += [p.stem, f"{p.parents[2].name}:{p.stem}"]
+    return frozenset(n.lower() for n in names)
 
 
 def slash_command(rest: str, skills: Container[str]) -> str:
@@ -81,8 +83,12 @@ def slash_command(rest: str, skills: Container[str]) -> str:
         return "/"
     norm = [w.strip(",.!?").lower() for w in words]
     for k in range(min(4, len(words)), 0, -1):
-        # Joined with hyphens, or with nothing for a name Whisper split: "pony tail".
-        for name in ("-".join(norm[:k]), "".join(norm[:k])):
+        # Joined with hyphens, or with nothing for a name Whisper split: "pony tail",
+        # or as plugin:skill, "superpowers writing plans".
+        names = ["-".join(norm[:k]), "".join(norm[:k])]
+        if k > 1:
+            names.append(norm[0] + ":" + "-".join(norm[1:k]))
+        for name in names:
             if name in skills:
                 return " ".join(["/" + name, *words[k:]])
     return " ".join(["/" + norm[0], *words[1:]])

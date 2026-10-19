@@ -87,6 +87,10 @@ class Store:
             for column in ADDED_COLUMNS:
                 if column.split()[0] not in have:
                     conn.execute(f"ALTER TABLE dictations ADD COLUMN {column}")
+            # An old capture bug read a sent, emptied box back as the user's correction.
+            conn.execute("UPDATE dictations SET final = NULL, final_source = NULL "
+                         "WHERE final_source = 'implicit' "
+                         "AND trim(final, ' ' || char(9, 10, 13)) = ''")
         logger.info(f"History database at {self._path}")
 
     def _conn(self) -> sqlite3.Connection:

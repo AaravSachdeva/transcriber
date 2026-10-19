@@ -149,7 +149,9 @@ def load(path: Path = SETTINGS_PATH) -> AppConfig:
         logger.info(f"No settings file at {path}; using defaults.")
         return cfg
     try:
-        _overlay(cfg, json.loads(path.read_text(encoding="utf-8")))
+        # utf-8-sig: a BOM (PowerShell's Set-Content adds one) made the whole file
+        # unreadable, and every setting silently fell back to its default.
+        _overlay(cfg, json.loads(path.read_text(encoding="utf-8-sig")))
         logger.info(f"Settings loaded from {path}")
     except Exception as exc:
         logger.exception(f"Settings at {path} are unreadable ({exc}); using defaults.")

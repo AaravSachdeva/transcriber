@@ -6,11 +6,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "faster-whisper>=1.2.0",
-  # ctranslate2 links against cuBLAS and cuDNN 9 for CUDA 12 but does not bundle them.
-  # torch used to supply these DLLs as a side effect; these wheels do it directly and
-  # cost about a quarter of what the torch stack did.
-  "nvidia-cublas-cu12>=12.4",
-  "nvidia-cudnn-cu12>=9,<10",
   "sounddevice>=0.4.6",
   "numpy>=1.24.0",
   "pynput>=1.8.0",
@@ -19,7 +14,18 @@ dependencies = [
   "loguru>=0.7.0",
 ]
 
-[project.scripts]
+[project.optional-dependencies]
+# ctranslate2 links against cuBLAS and cuDNN 9 for CUDA 12 but does not bundle them.
+# torch used to supply these DLLs as a side effect; these wheels do it directly and
+# cost about a quarter of what the torch stack did. An extra, because they are 2 GB
+# that a PC without an NVIDIA GPU cannot use; the installer adds it only when one exists.
+cuda = [
+  "nvidia-cublas-cu12>=12.4",
+  "nvidia-cudnn-cu12>=9,<10",
+]
+
+# A GUI script, so uv generates a windowless transcriber.exe.
+[project.gui-scripts]
 transcriber = "app.main:main"
 
 [build-system]

@@ -37,7 +37,7 @@ oleaut32.VariantClear.argtypes = [c_void_p]
 POLL_S = 1.0        # how often the text box is read while a dictation is watched
 WATCH_S = 60.0      # how long after the paste an edit still counts as a correction
 MAX_CHARS = 100_000  # a bigger box is a document, and diffing it every second is not free
-MIN_MATCH = 0.8     # how closely the span found must resemble what was pasted
+MIN_MATCH = 0.8     # how closely the span must resemble what was pasted, found or edited
 PASTE_POLLS = 3     # polls allowed for the paste to show up in the box
 
 UIA_TEXT_PATTERN = 10014
@@ -188,7 +188,8 @@ def locate(before: str, after: str, inserted: str) -> tuple[int, int]:
 
 def track(prev: str, cur: str, start: int, end: int) -> Optional[tuple[int, int]]:
     """Where the span prev[start:end] is in cur. None when an edit crossed its edge or
-    it is gone: the box was cleared, or the message sent.
+    it is gone: the box was cleared, or the message sent. A box that shows a placeholder
+    once sent reads as that placeholder, so a box with nothing left of before is gone too.
 
     Typing at either edge counts as new text, not as a correction.
     ponytail: one diff per poll, so a fix and new typing inside the same second merge,
@@ -198,6 +199,8 @@ def track(prev: str, cur: str, start: int, end: int) -> Optional[tuple[int, int]
     prefix, suffix = _common(prev, cur)
     changed_end = len(prev) - suffix  # prev[prefix:changed_end] became cur[prefix:-suffix]
     delta = len(cur) - len(prev)
+    if not prefix and not suffix:
+        return None
     if changed_end <= start:
         return start + delta, end + delta
     if prefix >= end:
@@ -322,6 +325,10 @@ class FieldWatcher:
         span = track(w["last"], text, *w["span"])
         if span is None:
             return False  # finish with the last snapshot that still held the span
+        if not _matches(text[span[0]:span[1]], w["pasted"]):
+            # Deleted or rewritten a bit at a time. What is left is no correction.
+            w.update(span=None, outcome="the pasted text was deleted or rewritten")
+            return False
         w.update(span=span, last=text)
         return True
 
