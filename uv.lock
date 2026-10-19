@@ -1032,12 +1032,16 @@ dependencies = [
     { name = "faster-whisper" },
     { name = "loguru" },
     { name = "numpy" },
-    { name = "nvidia-cublas-cu12" },
-    { name = "nvidia-cudnn-cu12" },
     { name = "pynput" },
     { name = "pyside6" },
     { name = "requests" },
     { name = "sounddevice" },
+]
+
+[package.optional-dependencies]
+cuda = [
+    { name = "nvidia-cublas-cu12" },
+    { name = "nvidia-cudnn-cu12" },
 ]
 
 [package.metadata]
@@ -1045,13 +1049,14 @@ requires-dist = [
     { name = "faster-whisper", specifier = ">=1.2.0" },
     { name = "loguru", specifier = ">=0.7.0" },
     { name = "numpy", specifier = ">=1.24.0" },
-    { name = "nvidia-cublas-cu12", specifier = ">=12.4" },
-    { name = "nvidia-cudnn-cu12", specifier = ">=9,<10" },
+    { name = "nvidia-cublas-cu12", marker = "extra == 'cuda'", specifier = ">=12.4" },
+    { name = "nvidia-cudnn-cu12", marker = "extra == 'cuda'", specifier = ">=9,<10" },
     { name = "pynput", specifier = ">=1.8.0" },
     { name = "pyside6", specifier = ">=6.7.0" },
     { name = "requests", specifier = ">=2.31.0" },
     { name = "sounddevice", specifier = ">=0.4.6" },
 ]
+provides-extras = ["cuda"]
 
 [[package]]
 name = "typer"

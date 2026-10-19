@@ -19,12 +19,14 @@ from PySide6.QtWidgets import (
 
 from . import theme
 from .. import autostart
-from ..config import AppConfig, SETTINGS_PATH
+from ..config import AppConfig, DB_PATH, SETTINGS_PATH
 from ..hotkey import MIN_HOLD_THRESHOLD_MS
 from ..transcription import SAMPLE_RATE
 
 WHISPER_MODELS = [
     "distil-large-v3", "large-v3-turbo", "large-v3", "medium", "small", "base",
+    # The CPU tiers the hardware test can pick (app/autosetup.py).
+    "small.en", "base.en",
 ]
 COMPUTE_TYPES = ["int8_float16", "int8", "float16"]
 DEVICES = ["auto", "cuda", "cpu"]
@@ -123,8 +125,6 @@ class SettingsScreen(QWidget):
         self._llm_enabled.setChecked(cfg.ollama.enabled)
         self._llm_model = QComboBox()
         self._llm_model.setEditable(True)
-        available = ollama_models(cfg.ollama.base_url)
-        self._llm_model.addItems(available or [cfg.ollama.model])
         self._llm_model.setCurrentText(cfg.ollama.model)
         self._threshold = QSpinBox()
         self._threshold.setRange(0, 100)
@@ -145,8 +145,10 @@ class SettingsScreen(QWidget):
         form.addRow("", self._context_formatting)
         note(
             "Transcripts shorter than the skip threshold are pasted straight away, so "
-            "short replies stay instant. A smaller context size uses less VRAM."
-            + ("" if available else " Ollama is not reachable, so the model list is empty."))
+            "short replies stay instant. A smaller context size uses less VRAM.")
+        self._ollama_down = theme.label(
+            "Ollama is not reachable, so only the current model is listed.", "Caption", wrap=True)
+        form.addRow(self._ollama_down)
 
         # --- behaviour ---
         section("Behaviour")
@@ -171,6 +173,19 @@ class SettingsScreen(QWidget):
             "Held longer than the threshold is push-to-talk. A quicker tap latches "
             "recording on until you tap again. Raise the settle delay if a slow app "
             "ever pastes truncated text.")
+
+        # --- learning ---
+        section("Learning")
+        self._learn = QCheckBox("Learn from my corrections")
+        self._learn.setChecked(cfg.learn_from_corrections)
+        self._keep_audio = QCheckBox("Keep recordings of my voice")
+        self._keep_audio.setChecked(cfg.keep_audio)
+        form.addRow("", self._learn)
+        form.addRow("", self._keep_audio)
+        note(
+            "After a paste, Transcriber reads the text box you dictated into for up to a "
+            "minute and keeps only the part it pasted, as you left it. Recordings are "
+            f"saved in {DB_PATH.parent / 'audio'}. Nothing leaves this computer.")
 
         # Sections scroll; the title and the Save row stay put.
         sections = QWidget()
@@ -205,6 +220,19 @@ class SettingsScreen(QWidget):
         layout.addWidget(title)
         layout.addWidget(scroll, 1)
         layout.addLayout(footer)
+        # After the layouts are installed: shown while still parentless, a label is a window.
+        self.reload_models()
+
+    def reload_models(self) -> None:
+        """Fill the LLM list from Ollama. Called again each time Settings is opened: this
+        screen is built at launch, before the controller has started Ollama, and a list
+        fetched only then held nothing but the current model."""
+        current = self._llm_model.currentText()
+        available = ollama_models(self._cfg.ollama.base_url)
+        self._llm_model.clear()
+        self._llm_model.addItems(available or [current])
+        self._llm_model.setCurrentText(current)
+        self._ollama_down.setVisible(not available)
 
     @staticmethod
     def _select_data(combo: QComboBox, value) -> None:
@@ -228,6 +256,8 @@ class SettingsScreen(QWidget):
 
         cfg.hotkey.hold_threshold_ms = self._hold.value()
         cfg.paste_settle_ms = self._settle.value()
+        cfg.learn_from_corrections = self._learn.isChecked()
+        cfg.keep_audio = self._keep_audio.isChecked()
 
         wanted = self._autostart.isChecked()
         if wanted != autostart.is_enabled():

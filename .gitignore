@@ -12,3 +12,10 @@ wheels/
 # Benchmark artifacts
 bench_sample.wav
 bench_results.json
+
+# Copied in by installer/build.ps1
+installer/uv.exe
+
+# Model weights
+*.gguf
+*.safetensors

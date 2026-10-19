@@ -97,6 +97,8 @@ class MainWindow(QMainWindow):
             self.stats.reload()
         elif self._stack.currentWidget() is self.history:
             self.history.reload()
+        elif self._stack.currentWidget() is self.settings:
+            self.settings.reload_models()
 
     def _on_state(self, state: State) -> None:
         self._dot.setPixmap(dot_icon(STATE_COLOURS[state]).pixmap(14, 14))
@@ -120,3 +122,9 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    def fix_last(self) -> None:
+        """The "that was wrong" entry point: History, newest dictation, correction open."""
+        self.show_and_raise()
+        self._nav.setCurrentRow(0)
+        self.history.correct_latest()

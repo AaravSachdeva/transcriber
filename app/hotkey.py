@@ -40,17 +40,26 @@ class HoldToggleHotkey:
         self,
         on_start: Callable[[bool], None],
         on_stop: Callable[[], None],
+        on_cancel: Callable[[], None],
+        on_shortcut: Callable[[], None],
         hold_threshold_ms: int = 400,
     ) -> None:
-        """:param on_start: called with is_edit=True when Shift was also held."""
+        """:param on_start: called with is_edit=True when Shift was also held.
+        :param on_cancel: called on every Esc press; the caller ignores it when idle.
+        :param on_shortcut: called when right Ctrl turned out to be part of a shortcut.
+            The start it follows may have been refused, so the caller cancels only a
+            recording, never a dictation still being processed."""
         self._on_start = on_start
         self._on_stop = on_stop
+        self._on_cancel = on_cancel
+        self._on_shortcut = on_shortcut
         self._hold_threshold_s = max(hold_threshold_ms, MIN_HOLD_THRESHOLD_MS) / 1000.0
 
         self._listener: Optional[keyboard.Listener] = None
         self._pressed_at: Optional[float] = None  # None means the key is not down
         self._shift_down = False
         self._latched = False  # recording continues after release
+        self._chord = False  # this hold of right Ctrl is a shortcut, not dictation
 
     # --- decision logic, kept free of pynput so it can be tested directly ---
 
@@ -70,6 +79,9 @@ class HoldToggleHotkey:
         pressed_at, self._pressed_at = self._pressed_at, None
         if pressed_at is None:
             return Dictation.NOTHING  # release without a press we saw
+        if self._chord:
+            self._chord = False
+            return Dictation.NOTHING  # a shortcut: neither latch nor stop
 
         held_s = now - pressed_at
         if self._latched:
@@ -81,6 +93,18 @@ class HoldToggleHotkey:
         self._latched = True
         return Dictation.NOTHING  # tap: keep recording until the next tap
 
+    def chord(self) -> bool:
+        """Another key went down. While right Ctrl is held that makes it a shortcut
+        (right Ctrl+C), which a quick press would otherwise turn into a latched mic.
+        True when the caller should cancel the recording this press started; only once
+        per hold, and never for a latched dictation, which keeps running.
+
+        _pressed_at stays set, so auto-repeat still cannot start a recording."""
+        if self._pressed_at is None or self._chord:
+            return False
+        self._chord = True
+        return not self._latched
+
     @property
     def latched(self) -> bool:
         return self._latched
@@ -89,21 +113,36 @@ class HoldToggleHotkey:
         """Forget all key state. Used when the pipeline aborts on an error."""
         self._pressed_at = None
         self._latched = False
+        self._chord = False
+
+    def unlatch(self) -> None:
+        """Forget the latch but not a key still held. Used on cancel: clearing
+        _pressed_at too would let auto-repeat start a new recording at once."""
+        self._latched = False
 
     # --- pynput plumbing ---
 
-    def _on_press(self, key) -> None:
+    def _on_press(self, key, injected: bool = False) -> None:
         if key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
             self._shift_down = True
             return
+        if key == keyboard.Key.esc:
+            # Not suppressed either, so the focused app still gets its Esc.
+            self._on_cancel()
+            return
         if key != TRIGGER:
+            # Injected keys are this app's own: the edit's Ctrl+C runs while right Ctrl
+            # is still held, and must not cancel the edit it serves.
+            if not injected and self.chord():
+                logger.info("Right Ctrl used in a shortcut: cancelling.")
+                self._on_shortcut()
             return
         if self.press(time.monotonic()) == Dictation.START:
             is_edit = self._shift_down
             logger.info(f"Right Ctrl down: starting recording (edit={is_edit}).")
             self._on_start(is_edit)
 
-    def _on_release(self, key) -> None:
+    def _on_release(self, key, injected: bool = False) -> None:
         if key in (keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r):
             self._shift_down = False
             return

@@ -24,7 +24,8 @@ def _command() -> str:
     exe = Path(sys.executable)
     windowed = exe.with_name("pythonw.exe")
     interpreter = windowed if windowed.exists() else exe
-    return f'"{interpreter}" -m app.main'
+    # --hidden: at login, straight to the tray rather than opening the window.
+    return f'"{interpreter}" -m app.main --hidden'
 
 
 def is_enabled() -> bool:

@@ -45,7 +45,8 @@ def dot_icon(colour: str, size: int = 64) -> QIcon:
 
 
 class Tray(QSystemTrayIcon):
-    def __init__(self, on_open: Callable[[], None], on_quit: Callable[[], None]) -> None:
+    def __init__(self, on_open: Callable[[], None], on_fix: Callable[[], None],
+                 on_quit: Callable[[], None]) -> None:
         super().__init__()
         self._icons = {state: dot_icon(colour) for state, colour in STATE_COLOURS.items()}
         self._state = State.IDLE
@@ -55,6 +56,9 @@ class Tray(QSystemTrayIcon):
         open_action = QAction("Open Transcriber", menu)
         open_action.triggered.connect(lambda: on_open())
         menu.addAction(open_action)
+        fix_action = QAction("Fix last dictation...", menu)
+        fix_action.triggered.connect(lambda: on_fix())
+        menu.addAction(fix_action)
         menu.addSeparator()
         quit_action = QAction("Quit", menu)
         quit_action.triggered.connect(lambda: on_quit())

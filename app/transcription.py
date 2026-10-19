@@ -33,8 +33,8 @@ _FILLER = re.compile(r"\b(?:um+|uh+|erm)\b[,.]?\s*", re.I)
 
 
 def tidy(text: str) -> str:
-    """Remove fillers and stutters without the LLM, so they go even when it is skipped,
-    unavailable, or rejected."""
+    """Remove fillers and stutters without the LLM, so they go even when it is skipped
+    or unavailable."""
     return _REPEAT.sub(r"\1", _FILLER.sub("", text)).strip()
 
 
